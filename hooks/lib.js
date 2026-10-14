@@ -217,3 +217,44 @@ export const sumModelUse = (tables) => {
   }
   return Object.fromEntries(Object.entries(out).sort((a, b) => b[1].out - a[1].out))
 }
+
+// A row of block characters, one per value, scaled to the largest. Zero and missing draw lowest.
+const SPARKS = '▁▂▃▄▅▆▇█'
+export const sparkline = (vals) => {
+  const max = Math.max(0, ...vals.map((v) => v ?? 0))
+  return vals.map((v) => (max > 0 && v > 0 ? SPARKS[Math.min(7, Math.max(1, Math.round(((v ?? 0) / max) * 7)))] : SPARKS[0])).join('')
+}
+
+// Turns left until the context fills, from the growth of the last turns (tokens after each
+// main turn). Null while there is too little to go on or nothing grows.
+export const turnsLeft = (hist, window) => {
+  if (!window || hist.length < 3) return null
+  const last = hist.slice(-6)
+  const growth = (last[last.length - 1] - last[0]) / (last.length - 1)
+  if (growth <= 0) return null
+  return Math.max(0, Math.floor((window - last[last.length - 1]) / growth))
+}
+
+// Share of the input that came from the cache, 0–100, over a per-model table.
+export const cacheHit = (table) => {
+  let fresh = 0
+  let cached = 0
+  for (const r of Object.values(table ?? {})) {
+    fresh += r.in
+    cached += r.cached
+  }
+  return fresh + cached > 0 ? (cached / (fresh + cached)) * 100 : null
+}
+
+export const addToolUse = (table, tool, ms, isError) => {
+  const r = table[tool] ?? { n: 0, err: 0, ms: 0 }
+  return { ...table, [tool]: { n: r.n + 1, err: r.err + (isError ? 1 : 0), ms: r.ms + Math.max(0, ms ?? 0) } }
+}
+
+const csvCell = (v) => {
+  const s = v == null ? '' : String(v)
+  // A leading = + - @ would run as a formula in a spreadsheet.
+  const safe = /^[=+\-@\t\r]/.test(s) ? "'" + s : s
+  return /[",\n]/.test(safe) ? '"' + safe.replace(/"/g, '""') + '"' : safe
+}
+export const toCsv = (rows) => rows.map((r) => r.map(csvCell).join(',')).join('\n') + '\n'

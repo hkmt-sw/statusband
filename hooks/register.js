@@ -9,13 +9,14 @@
 // Layout ideas (docked/inline modes, agent rows, last-turn receipt) were inspired by
 // scasella/claude-flightdeck (MIT); no code was copied.
 
-import { num, fmtTokens, fmtDur, fmtUsd, fmtClock, dayKey, toMs, bar, shorten, prettyModel, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts, ownerOf, addModelUse, sumModelUse } from './lib.js'
+import { num, fmtTokens, fmtDur, fmtUsd, fmtClock, dayKey, toMs, bar, shorten, prettyModel, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts, ownerOf, addModelUse, sumModelUse, sparkline, turnsLeft, cacheHit, addToolUse, toCsv } from './lib.js'
 
 // ---------------------------------------------------------------- settings ---
 
 const PANE = 'statusband'
 const SCRIPTS_PANE = 'statusband-scripts' // its own tab beside the status pane
 const AGENTS_PANE = 'statusband-agents' // likewise
+const COSTS_PANE = 'statusband-costs' // cost, models, repos, tools
 const PANE_COLUMNS = 46
 const PANE_ROWS = 9
 const GIT_EVERY_MS = 15_000
@@ -32,6 +33,11 @@ const TOAST_LEVELS = [80, 95]
 const LEDGER_DAYS = 35
 const MODEL_DAYS = 7 // /statusband models adds up this many days
 const SESSIONS_SHOWN = 15 // and lists this many sessions, newest first
+const TREND_DAYS = 14 // the Costs tab's daily cost sparkline
+const REPORT_DAYS = 30 // /statusband report's default span
+const CACHE_WARN = 80 // cache share of the input below this is amber, below CACHE_CRIT red
+const CACHE_CRIT = 50
+const SHOWN_ROWS = 5 // repos and tools on the Costs tab
 const AGENTS_KEPT = 20 // finished ones the Agents tab keeps, newest first
 const SCRIPTS_DIR = '.scripts' // in the working directory; ignores itself in git
 const SCRIPTS_SHOWN = 5
@@ -102,6 +108,13 @@ let modelsMine = {} // likewise, this session's share of today
 let modelsToday = {} // every session's today, added up
 let modelsDay = null // the day modelsMine counts
 let sessionNamed = false // this session's name is in the store, for /statusband models
+let costsPaneOpen = false
+let costsClosedByUser = false
+let costTrend = [] // daily cost, oldest first, TREND_DAYS long
+let repoUse = [] // last MODEL_DAYS by repo: [{ repo, cost, ms, out }]
+let toolUse = {} // this session: { [tool]: { n, err, ms } }
+let turnToolMs = 0 // tool time in the running main turn
+let ctxHist = [] // context tokens after each main turn, since the last drop
 
 // ----------------------------------------------------------------- helpers ---
 
@@ -237,6 +250,19 @@ async function recordCost($, now) {
   const cur = Number((await $.store.get(dk)) ?? 0)
   if (delta > 0) await $.store.set(dk, cur + delta)
   costToday = cur + Math.max(0, delta)
+  if (delta > 0) {
+    const ck = 'costs:' + dayKey(now)
+    const by = (await $.store.get(ck)) ?? {}
+    await $.store.set(ck, { ...by, [sid]: (by[sid] ?? 0) + delta })
+    await nameSession($, sid)
+  }
+}
+
+// The session's repo and start, kept once, so the ledgers can name it.
+async function nameSession($, sid) {
+  if (sessionNamed || !sid) return
+  sessionNamed = true
+  await $.store.set('session:' + sid, { repo: git?.repo ?? null, startedAt: startedAt ?? sessionSeenAt })
 }
 
 // A model call's tokens and time, kept by session within the day, so sessions do not
@@ -258,10 +284,7 @@ async function recordModelUse($, m, usage, ms) {
   }
   const next = { ...all, [sessionId]: modelsMine }
   await $.store.set(key, next)
-  if (!sessionNamed) {
-    sessionNamed = true
-    await $.store.set('session:' + sessionId, { repo: git?.repo ?? null, startedAt: startedAt ?? sessionSeenAt })
-  }
+  await nameSession($, sessionId)
   modelsToday = sumModelUse(Object.values(next))
 }
 
@@ -271,18 +294,77 @@ async function modelsOver($, days, now) {
   return sumModelUse(tables)
 }
 
-// The last days by session, the newest session first: [{ id, repo, startedAt, use }].
+// Per day and session, oldest day first: [{ day, id, repo, startedAt, use, cost }].
+async function ledgerDays($, days, now) {
+  const rows = []
+  const metas = {}
+  for (let i = days - 1; i >= 0; i--) {
+    const day = dayKey(now - i * 86400_000)
+    const models = (await $.store.get('models:' + day)) ?? {}
+    const costs = (await $.store.get('costs:' + day)) ?? {}
+    for (const sid of new Set([...Object.keys(models), ...Object.keys(costs)])) {
+      metas[sid] ??= (await $.store.get('session:' + sid)) ?? {}
+      rows.push({ day, id: sid, repo: metas[sid].repo ?? null, startedAt: metas[sid].startedAt ?? null, use: models[sid] ?? {}, cost: costs[sid] ?? 0 })
+    }
+  }
+  return rows
+}
+
+// The last days by session, the newest session first: [{ id, repo, startedAt, use, cost }].
 async function sessionsOver($, days, now) {
   const by = {}
-  for (let i = 0; i < days; i++) {
-    for (const [sid, t] of Object.entries((await $.store.get('models:' + dayKey(now - i * 86400_000))) ?? {})) (by[sid] ??= []).push(t)
+  for (const r of await ledgerDays($, days, now)) {
+    const x = (by[r.id] ??= { id: r.id, repo: r.repo, startedAt: r.startedAt, tables: [], cost: 0 })
+    x.tables.push(r.use)
+    x.cost += r.cost
   }
-  const out = []
-  for (const [sid, tables] of Object.entries(by)) {
-    const meta = (await $.store.get('session:' + sid)) ?? {}
-    out.push({ id: sid, repo: meta.repo ?? null, startedAt: meta.startedAt ?? null, use: sumModelUse(tables) })
+  return Object.values(by)
+    .map(({ tables, ...x }) => ({ ...x, use: sumModelUse(tables) }))
+    .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))
+}
+
+// The Costs tab's slower figures: the daily trend and the repos, read from the store.
+async function refreshLedger($) {
+  const now = Date.now()
+  const trend = []
+  for (let i = TREND_DAYS - 1; i >= 0; i--) trend.push(Number((await $.store.get('day:' + dayKey(now - i * 86400_000))) ?? 0))
+  costTrend = trend
+  const by = {}
+  for (const x of await sessionsOver($, MODEL_DAYS, now)) {
+    const r = (by[x.repo ?? '?'] ??= { repo: x.repo ?? '?', cost: 0, ms: 0, out: 0 })
+    r.cost += x.cost
+    for (const u of Object.values(x.use)) {
+      r.ms += u.ms
+      r.out += u.out
+    }
   }
-  return out.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))
+  repoUse = Object.values(by).sort((a, b) => b.cost - a.cost || b.ms - a.ms)
+}
+
+// /statusband report: one CSV row per day and session.
+async function writeReport($, days) {
+  const now = Date.now()
+  const rows = await ledgerDays($, days, now)
+  const csv = toCsv([
+    ['day', 'repo', 'session', 'session_start', 'cost_usd', 'model_minutes', 'calls', 'tokens_in', 'tokens_cached', 'tokens_out', 'models'],
+    ...rows.map((r) => {
+      const u = Object.values(r.use)
+      const sum = (k) => u.reduce((n, x) => n + x[k], 0)
+      return [r.day, r.repo ?? '', r.id, r.startedAt ? fmtDay(r.startedAt) : '', r.cost.toFixed(2), (sum('ms') / 60_000).toFixed(1), sum('steps'), sum('in'), sum('cached'), sum('out'), Object.keys(r.use).map((m) => prettyModel(m) ?? m).join('; ')]
+    }),
+  ])
+  const path = String((await $.env.get('TMPDIR').catch(() => null)) || '/tmp').replace(/\/+$/, '') + '/statusband-report-' + dayKey(now) + '.csv'
+  await $.fs.write(path, csv)
+  const by = {}
+  for (const r of rows) {
+    const x = (by[r.repo ?? '?'] ??= { cost: 0, ms: 0 })
+    x.cost += r.cost
+    x.ms += Object.values(r.use).reduce((n, u) => n + u.ms, 0)
+  }
+  const lines = Object.entries(by)
+    .sort((a, b) => b[1].cost - a[1].cost)
+    .map(([repo, x]) => '  ' + repo + ': ' + fmtUsd(x.cost) + ' · ' + fmtDur(x.ms))
+  return { path, rows: rows.length, text: lines.join('\n') }
 }
 
 async function pruneStore($, now) {
@@ -290,6 +372,7 @@ async function pruneStore($, now) {
     for (const k of await $.store.keys()) {
       if (k.startsWith('day:') && now - Date.parse(k.slice(4)) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
       if (k.startsWith('models:') && now - Date.parse(k.slice(7)) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
+      if (k.startsWith('costs:') && now - Date.parse(k.slice(6)) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
       if (k.startsWith('session:')) {
         const v = await $.store.get(k)
         if (!v || now - (v.startedAt ?? 0) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
@@ -502,6 +585,7 @@ function sidebarLines($, now, W) {
     const r = [seg('🧾 last turn ' + fmtDur(lastTurn.durationMs), C.gray)]
     if (lastTurn.costDelta != null) r.push(seg(' · +' + fmtUsd(lastTurn.costDelta), C.green, { pri: 1 }))
     if (lastTurn.agents) r.push(seg(' · ' + lastTurn.agents + ' ag', C.teal, { pri: 2 }))
+    if (lastTurn.toolMs >= 1000) r.push(seg(' · 🔧 ' + fmtDur(lastTurn.toolMs), C.gray, { pri: 3 }))
     L.push(r)
   }
 
@@ -520,6 +604,8 @@ function sidebarLines($, now, W) {
     L.push(blank(), head('🧠 Context', C.text))
     L.push([seg(f, col), seg(e, C.light), seg('  ' + Math.round(ctx.pct) + '%', col, { bold: true })])
     L.push([seg(fmtTokens(ctx.tokens) + ' / ' + fmtTokens(ctx.window) + ' tokens', C.gray)])
+    const left = turnsLeft(ctxHist, ctx.window)
+    if (left != null && left < 50) L.push([seg('⏳ ~' + left + (left === 1 ? ' turn' : ' turns') + ' until full', left < 2 ? C.red : left < 5 ? C.amber : C.gray)])
   }
 
   for (const q of quotas) {
@@ -541,23 +627,69 @@ function sidebarLines($, now, W) {
     L.push([seg(run.length + ' running', C.teal, { bold: true }), seg(tok ? ' · ' + fmtTokens(tok) + ' ctx' : '', C.teal, { pri: 1 }), seg('  → Agents tab', C.gray, { pri: 2 })])
   }
 
+  // The details are the Costs tab's; here only the totals.
   if (costUsd != null) {
     L.push(blank(), head('💰 Cost', C.text))
-    L.push([seg(fmtUsd(costUsd), C.green, { bold: true }), seg(' session', C.gray)])
-    if (costToday != null) L.push([seg(fmtUsd(costToday), C.green, { bold: true }), seg(' today 📆', C.gray)])
+    L.push([
+      seg(fmtUsd(costUsd), C.green, { bold: true }),
+      seg(' session', C.gray),
+      ...(costToday != null ? [seg(' · ' + fmtUsd(costToday) + ' today', C.gray, { pri: 1 })] : []),
+      seg('  → Costs tab', C.gray, { pri: 2 }),
+    ])
+  }
+  return L
+}
+
+// The Costs tab: cost and its trend, cache share, models, repos, tools.
+function costsLines(now, W) {
+  const L = []
+  const head = (t) => [seg(t, C.text, { bold: true })]
+  if (costUsd == null && !Object.keys(modelsSession).length) return [[seg('No cost yet in this session.', C.gray)]]
+
+  if (costUsd != null) {
+    L.push(head('💰 Cost'))
+    L.push([seg(fmtUsd(costUsd), C.green, { bold: true }), seg(' session', C.gray), ...(costToday != null ? [seg(' · ', C.light), seg(fmtUsd(costToday), C.green, { bold: true }), seg(' today', C.gray)] : [])])
     if (startedAt && now - startedAt > 5 * 60_000) L.push([seg('🔥 ' + fmtUsd(costUsd / ((now - startedAt) / 3600_000)) + '/h', C.orange, { bold: true })])
+    const days = costTrend.filter((v) => v > 0)
+    if (days.length > 1) {
+      L.push([seg(sparkline(costTrend), C.green), seg('  ' + TREND_DAYS + 'd', C.gray), seg(' · avg ' + fmtUsd(days.reduce((a, b) => a + b, 0) / days.length) + '/day', C.gray, { pri: 1 })])
+    }
+  }
+
+  const hit = cacheHit(modelsSession)
+  if (hit != null) {
+    const col = hit >= CACHE_WARN ? C.green : hit >= CACHE_CRIT ? C.amber : C.red
+    L.push([seg('♻️ cache ', C.gray), seg(Math.round(hit) + '%', col, { bold: true }), seg(' of the input · session', C.gray, { pri: 1 })])
   }
 
   const mine = Object.entries(modelsSession)
   if (mine.length) {
-    L.push(blank(), head('🤖 Models · session', C.text))
+    L.push(blank(), head('🤖 Models · session'))
     for (const [m, r] of mine) L.push(...modelUseLines(m, r))
   }
   const today = Object.entries(modelsToday)
   if (today.length) {
-    L.push(blank(), head('📆 Models · today', C.text))
+    L.push(blank(), head('📆 Models · today'))
     for (const [m, r] of today) L.push(modelUseRow(m, r))
   }
+
+  if (repoUse.length) {
+    L.push(blank(), head('📁 Repos · ' + MODEL_DAYS + ' days'))
+    for (const r of repoUse.slice(0, SHOWN_ROWS)) {
+      L.push([seg(shorten(r.repo, 16), C.blue, { bold: true }), seg(' · ' + fmtUsd(r.cost), C.green), seg(' · ' + fmtDur(r.ms), C.gray, { pri: 1 }), seg(' · ' + fmtTokens(r.out) + ' out', C.light, { pri: 2 })])
+    }
+    if (repoUse.length > SHOWN_ROWS) L.push([seg('+' + (repoUse.length - SHOWN_ROWS) + ' more', C.light)])
+  }
+
+  const tools = Object.entries(toolUse).sort((a, b) => b[1].ms - a[1].ms)
+  if (tools.length) {
+    L.push(blank(), head('🔧 Tools · session'))
+    for (const [t, r] of tools.slice(0, SHOWN_ROWS)) {
+      L.push([seg(shorten(t, 14), C.text), seg(' ' + r.n + '×', C.gray), seg(' · ' + fmtDur(r.ms), C.gray), ...(r.err ? [seg(' · ' + r.err + ' err', C.red, { pri: 1 })] : [])])
+    }
+  }
+
+  L.push(blank(), [seg('/statusband report → CSV', C.light, { pri: 1 })])
   return L
 }
 
@@ -694,9 +826,18 @@ async function openAgentsPane($) {
   } catch {}
 }
 
+async function openCostsPane($) {
+  if (costsPaneOpen || costsClosedByUser) return
+  try {
+    const r = await $.ui.open({ id: COSTS_PANE, title: 'Costs', columns: PANE_COLUMNS, rows: PANE_ROWS })
+    costsPaneOpen = r?.isPlaced !== false
+  } catch {}
+}
+
 async function openPane($) {
   await openScriptsPane($)
   await openAgentsPane($)
+  await openCostsPane($)
   try {
     paneOpen = await $.ui.open({ id: PANE, title: 'Status', columns: PANE_COLUMNS, rows: PANE_ROWS })
   } catch (err) {
@@ -725,13 +866,15 @@ export function register(on) {
       if (Date.now() - paneSeenAt < PANE_STALE_MS) await openScriptsPane($)
       $.ui.invalidate('ui.render')
     })
+    await refreshLedger($).catch(() => {})
     $.clock.every(TICK_MS, async () => {
       await pullUsage($)
+      await refreshLedger($).catch(() => {})
       pruneAgents()
       $.ui.invalidate('ui.render')
     })
     try {
-      await $.command.register({ name: 'statusband', description: 'Status sidebar: open or close it, run or copy a script from .scripts/, clean out other sessions\' scripts, or list tokens and time by model', argumentHint: '[open|close|run|copy|clean|models] [script]', immediate: true })
+      await $.command.register({ name: 'statusband', description: 'Status sidebar: open or close it, run or copy a script from .scripts/, clean out other sessions\' scripts, list tokens and time by model, or write a cost report (CSV)', argumentHint: '[open|close|run|copy|clean|models|report] [script|days]', immediate: true })
       await $.command.register({ name: 'statusband-debug', description: 'statusband: dump the raw data it reads', immediate: true })
     } catch {}
     return next(e)
@@ -745,6 +888,8 @@ export function register(on) {
       modelsSession = {}
       modelsDay = null // a new session id gets its own share of the day
       sessionNamed = false
+      toolUse = {}
+      ctxHist = []
     }
     return next(e)
   })
@@ -757,6 +902,7 @@ export function register(on) {
       cost = num((await $.session.usage())?.cost?.usd) ?? cost
     } catch {}
     turnStart = { at: Date.now(), cost }
+    turnToolMs = 0
     $.ui.invalidate('ui.render')
     return next(e)
   })
@@ -813,17 +959,22 @@ export function register(on) {
       if (a) {
         a.status = e.reason === 'answer' ? 'done' : e.reason === 'aborted' ? 'stopped' : 'failed'
         a.endedAt = now
+        // A background agent that ends while Claude waits on you would otherwise go unseen.
+        if (!isRunning) void Promise.resolve($.ui.notify((a.status === 'done' ? 'Agent finished: ' : 'Agent ' + a.status + ': ') + (a.desc || a.name), { title: git?.repo ?? 'Claude Code' })).catch(() => {})
       }
     } else {
       isRunning = false
       await pullUsage($)
       await refreshGit($)
       await refreshScripts($)
+      await refreshLedger($).catch(() => {})
+      if (ctx?.tokens != null) ctxHist = ctxHist.length && ctx.tokens < ctxHist[ctxHist.length - 1] ? [ctx.tokens] : [...ctxHist, ctx.tokens].slice(-12)
       const delta = turnStart?.cost != null && costUsd != null ? costUsd - turnStart.cost : null
       lastTurn = {
         durationMs: num(e.durationMs) ?? (turnStart ? now - turnStart.at : null),
         costDelta: delta != null && delta >= 0.005 ? delta : null,
         agents: [...agents.values()].filter((a) => turnStart && a.spawnedAt >= turnStart.at).length,
+        toolMs: turnToolMs,
       }
     }
     $.ui.invalidate('ui.render')
@@ -831,7 +982,13 @@ export function register(on) {
   })
 
   on('tool.call', async ($, e, next) => {
+    const t0 = Date.now()
     const done = await next(e)
+    if (done?.deny === undefined && e.tool) {
+      const ms = Date.now() - t0
+      toolUse = addToolUse(toolUse, String(e.tool), ms, !!done?.isError)
+      if (!e.agentId) turnToolMs += ms
+    }
     if (SCRIPT_WRITERS.includes(e.tool) && done?.deny === undefined && !done?.isError) {
       try {
         await claimScript($, e.file_path ?? e.notebook_path)
@@ -868,6 +1025,10 @@ export function register(on) {
       agentsPaneOpen = false
       if (e.origin?.kind === 'person') agentsClosedByUser = true
     }
+    if (e.id === COSTS_PANE) {
+      costsPaneOpen = false
+      if (e.origin?.kind === 'person') costsClosedByUser = true
+    }
     return next(e)
   }).catch(($, e, next) => next(e)) // an observer: a throw here must not stop the close
 
@@ -891,6 +1052,13 @@ export function register(on) {
     paneSeenAt = now // the dock is on screen with Agents as the tab on show
     const W = Math.max(24, (e.props?.bodyColumns ?? PANE_COLUMNS) - 1)
     return draw($, e, agentsLines(now, W, e.props?.scroll?.bodyRows), W)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: COSTS_PANE }, async ($, e) => {
+    const now = Date.now()
+    paneSeenAt = now // the dock is on screen with Costs as the tab on show
+    const W = Math.max(24, (e.props?.bodyColumns ?? PANE_COLUMNS) - 1)
+    return draw($, e, costsLines(now, W), W)
   })
 
   // Under the prompt: the compact view while neither dock tab is on screen. The pane is opened only
@@ -920,6 +1088,11 @@ export function register(on) {
       const n = await cleanScripts($)
       const left = scriptsOthers.length
       return { text: (n ? 'Removed ' + n + ' script' + (n === 1 ? '' : 's') + ' of other sessions from ' + SCRIPTS_DIR + '/.' : 'No scripts of other sessions to remove.') + (left ? ' Kept ' + left + ' changed in the last 15 minutes.' : '') }
+    }
+    if (verb === 'report') {
+      const days = Math.min(LEDGER_DAYS, Math.max(1, parseInt(rest[0], 10) || REPORT_DAYS))
+      const r = await writeReport($, days)
+      return { text: (r.rows ? 'Last ' + days + ' days by repo:\n' + r.text + '\n\n' : 'Nothing recorded in the last ' + days + ' days.\n') + 'CSV (one row per day and session): ' + r.path }
     }
     if (verb === 'models') {
       const now = Date.now()
@@ -960,14 +1133,17 @@ export function register(on) {
       paneClosedByUser = true
       scriptsClosedByUser = true
       agentsClosedByUser = true
+      costsClosedByUser = true
       await $.ui.close({ id: SCRIPTS_PANE }).catch(() => {})
       await $.ui.close({ id: AGENTS_PANE }).catch(() => {})
+      await $.ui.close({ id: COSTS_PANE }).catch(() => {})
       await $.ui.close({ id: PANE })
       return { text: 'statusband closed. The compact view stays under the prompt.' }
     }
     paneClosedByUser = false
     scriptsClosedByUser = false
     agentsClosedByUser = false
+    costsClosedByUser = false
     await refreshScripts($)
     const r = await openPane($)
     return { text: r?.isPlaced ? 'statusband opened.' : 'statusband is not shown yet: ' + (r?.reason ?? 'unknown') }
@@ -989,7 +1165,7 @@ export function register(on) {
     dump.turnStepKeys = lastStepKeys
     dump.paneOpen = paneOpen
     dump.panePlacement = panePlacement
-    dump.derived = { scripts, profile, git, ctx, costUsd, costToday, modelsSession, modelsToday, limits, quotas, model, effort, isRunning, lastTurn, agents: [...agents.values()] }
+    dump.derived = { scripts, profile, git, ctx, costUsd, costToday, costTrend, repoUse, toolUse, ctxHist, modelsSession, modelsToday, limits, quotas, model, effort, isRunning, lastTurn, agents: [...agents.values()] }
     const json = JSON.stringify(dump, null, 2)
     let saved = ''
     try {

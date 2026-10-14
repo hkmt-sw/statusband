@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 // @ts-ignore: plain JS module without types
-import { num, fmtTokens, fmtDur, fmtUsd, dayKey, toMs, bar, shorten, prettyModel, cells, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts, addModelUse, sumModelUse } from '../hooks/lib.js'
+import { num, fmtTokens, fmtDur, fmtUsd, dayKey, toMs, bar, shorten, prettyModel, cells, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts, addModelUse, sumModelUse, sparkline, turnsLeft, cacheHit, addToolUse, toCsv } from '../hooks/lib.js'
 
 const MIN = 60_000
 const HOUR = 60 * MIN
@@ -187,4 +187,27 @@ test('addModelUse and sumModelUse count by model, busiest first', async () => {
   expect(Object.keys(t)).toEqual(['claude-haiku-5-5', 'claude-opus-5-5'])
   expect(t['claude-opus-5-5'].out).toBe(50)
   expect(t['claude-opus-5-5'].steps).toBe(4)
+})
+
+test('sparkline scales to the largest day; empty days draw lowest', async () => {
+  expect(sparkline([0, 1, 2, 4, 8])).toBe('▁▂▃▅█')
+  expect(sparkline([0, 0])).toBe('▁▁')
+})
+
+test('turnsLeft projects the context growth of the last turns', async () => {
+  expect(turnsLeft([10_000, 20_000], 200_000)).toBeNull()
+  expect(turnsLeft([100_000, 120_000, 140_000], 200_000)).toBe(3)
+  expect(turnsLeft([100_000, 100_000, 100_000], 200_000)).toBeNull()
+})
+
+test('cacheHit and addToolUse', async () => {
+  expect(cacheHit({})).toBeNull()
+  expect(cacheHit({ a: { in: 10, cached: 90, out: 0, ms: 0, steps: 1 } })).toBe(90)
+  let t = addToolUse({}, 'Bash', 100, false)
+  t = addToolUse(t, 'Bash', 50, true)
+  expect(t.Bash).toEqual({ n: 2, err: 1, ms: 150 })
+})
+
+test('toCsv quotes what needs it and defuses formulas', async () => {
+  expect(toCsv([['a', 'b,c', 'say "hi"', '=SUM(A1)', 3]])).toBe('a,"b,c","say ""hi""",\'=SUM(A1),3\n')
 })

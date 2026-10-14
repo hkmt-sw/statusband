@@ -152,7 +152,7 @@ test('the status pane leaves scripts to their tab; /statusband opens both, statu
   expect(await ui.find({ type: 'Text', text: /deploy\.sh/ })).toBeUndefined()
   await ui.unmount()
   await $.command.run({ command: 'statusband', args: '' } as any)
-  expect(opened).toEqual(['statusband-scripts', 'statusband'])
+  expect(opened).toEqual(['statusband-scripts', 'statusband-costs', 'statusband'])
 })
 
 test('compact view offers the newest script of the session', async ($, on) => {
@@ -250,6 +250,11 @@ const agentBottoms = (opened?: string[]) => (on: any) => {
   if (opened) on('ui.open', async (_$: any, e: any) => (opened.push(e.id), { value: { isPlaced: true } }) as any)
 }
 
+const COSTS_TAB = {
+  plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband-costs',
+  props: { title: 'Costs', isFocused: false, bodyColumns: 44, placement: 'dock' },
+} as const
+
 const AGENTS_TAB = {
   plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband-agents',
   props: { title: 'Agents', isFocused: false, bodyColumns: 44, placement: 'dock' },
@@ -290,7 +295,7 @@ test('/statusband opens the Agents tab once there are agents, status last', asyn
   await setup($, on, undefined, agentBottoms(opened))
   await twoAgents($)
   await $.command.run({ command: 'statusband', args: '' } as any)
-  expect(opened).toEqual(['statusband-agents', 'statusband'])
+  expect(opened).toEqual(['statusband-agents', 'statusband-costs', 'statusband'])
 })
 
 test('files no session claims are the person\'s own: never deleted, no .gitignore written', async ($, on) => {
@@ -320,10 +325,7 @@ test('tokens and time add up by model, for the session and the day', async ($, o
   await twoAgents($)
   for await (const _ of $.turn.step({ turnId: 'm1', index: 0, model: 'claude-sonnet-5-5', messageCount: 1 } as any)) void _
   for await (const _ of $.turn.step({ turnId: 'm1', index: 1, model: 'claude-sonnet-5-5', messageCount: 2 } as any)) void _
-  const pane = await $.ui.mount({
-    plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband',
-    props: { title: 'Status', isFocused: false, bodyColumns: 44, placement: 'dock' },
-  } as any)
+  const pane = await $.ui.mount(COSTS_TAB as any)
   expect(await pane.find({ type: 'Text', text: /Models · session/ })).toBeDefined()
   expect(await pane.find({ type: 'Text', text: /Models · today/ })).toBeDefined()
   expect(await pane.find({ type: 'Text', text: /Sonnet 5\.5/ })).toBeDefined()
@@ -337,4 +339,46 @@ test('tokens and time add up by model, for the session and the day', async ($, o
   expect(r.text).toContain('Last 7 days:')
   expect(r.text).toMatch(/▶ demo · \d{4}-\d\d-\d\d \d\d:\d\d · s1:/)
   expect(r.text).toContain('    Sonnet 5.5: 2K in')
+})
+
+test('cost lives on the Costs tab: cache share, tools; the status pane keeps the totals', async ($, on) => {
+  await setup($, on, undefined, (on: any) => {
+    agentBottoms()(on)
+    on('tool.call', async () => ({ result: { text: 'ok' } }) as any)
+    on('turn.start', async (_$: any, e: any) => e)
+  })
+  await $.turn.start({ turnId: 'm1' } as any)
+  for await (const _ of $.turn.step({ turnId: 'm1', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as any)) void _
+  await $.tool.call({ tool: 'Bash', command: 'ls' } as any)
+  await $.tool.call({ tool: 'Bash', command: 'pwd' } as any)
+  const tab = await $.ui.mount(COSTS_TAB as any)
+  expect(await tab.find({ type: 'Text', text: /\$3\.21/ })).toBeDefined()
+  expect(await tab.find({ type: 'Text', text: /99%/ })).toBeDefined() // 127K cached of 128K
+  expect(await tab.find({ type: 'Text', text: /Tools · session/ })).toBeDefined()
+  expect(await tab.find({ type: 'Text', text: / 2×/ })).toBeDefined()
+  await tab.unmount()
+  const pane = await $.ui.mount({
+    plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband',
+    props: { title: 'Status', isFocused: false, bodyColumns: 44, placement: 'dock' },
+  } as any)
+  expect(await pane.find({ type: 'Text', text: /Costs tab/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /Models · session/ })).toBeUndefined()
+  await pane.unmount()
+})
+
+test('/statusband report writes a CSV row per day and session', async ($, on) => {
+  const written: { path: string; data: string }[] = []
+  await setup($, on, undefined, (on: any) => {
+    agentBottoms()(on)
+    on('fs.write', async (_$: any, e: any) => (written.push({ path: e.path, data: e.data ?? e.content ?? e.text }), { value: undefined }) as any)
+  })
+  for await (const _ of $.turn.step({ turnId: 'm1', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as any)) void _
+  const r: any = await $.command.run({ command: 'statusband', args: 'report 7' } as any)
+  expect(r.text).toContain('Last 7 days by repo:')
+  expect(r.text).toContain('demo:')
+  const csv = written.find((w) => /statusband-report-.*\.csv$/.test(w.path))
+  expect(csv).toBeDefined()
+  const lines = String(csv!.data).trim().split('\n')
+  expect(lines[0]).toBe('day,repo,session,session_start,cost_usd,model_minutes,calls,tokens_in,tokens_cached,tokens_out,models')
+  expect(lines[1]).toMatch(/^\d{4}-\d\d-\d\d,demo,s1,.*,1,1000,127000,39000,Opus 5\.5$/)
 })

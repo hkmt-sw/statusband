@@ -1,6 +1,6 @@
 {
   "name": "statusband",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Colorful status sidebar, or a compact view under the prompt: state, model, repo, context, plan limits, cost",
   "author": {
     "name": "Márton Tamás",
