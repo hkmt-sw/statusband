@@ -15,6 +15,7 @@ import { num, fmtTokens, fmtDur, fmtUsd, fmtClock, dayKey, toMs, bar, shorten, p
 
 const PANE = 'statusband'
 const SCRIPTS_PANE = 'statusband-scripts' // its own tab beside the status pane
+const AGENTS_PANE = 'statusband-agents' // likewise
 const PANE_COLUMNS = 46
 const PANE_ROWS = 9
 const GIT_EVERY_MS = 15_000
@@ -29,7 +30,7 @@ const PACE_WARN = 0.9
 const PACE_CRIT = 1.1
 const TOAST_LEVELS = [80, 95]
 const LEDGER_DAYS = 35
-const AGENT_KEEP_MS = 10 * 60_000
+const AGENTS_KEPT = 20 // finished ones the Agents tab keeps, newest first
 const SCRIPTS_DIR = '.scripts' // in the working directory; ignores itself in git
 const SCRIPTS_SHOWN = 5
 const SCRIPTS_KEEP_MS = 7 * 86_400_000 // other sessions' scripts older than this go at session start
@@ -90,6 +91,8 @@ let sessionSeenAt = Date.now() // fallback start when usage has no startedAt
 let scriptsDir = null // <session cwd>/.scripts, absolute
 let scriptsPaneOpen = false
 let scriptsClosedByUser = false
+let agentsPaneOpen = false
+let agentsClosedByUser = false
 
 // ----------------------------------------------------------------- helpers ---
 
@@ -297,9 +300,12 @@ async function pullUsage($) {
 
 const runningAgents = () => [...agents.values()].filter((a) => a.status === 'running')
 
-function pruneAgents(now) {
-  for (const [id, a] of agents) if (a.status !== 'running' && now - (a.endedAt ?? now) > AGENT_KEEP_MS) agents.delete(id)
+function pruneAgents() {
+  const ended = [...agents.values()].filter((a) => a.status !== 'running').sort((a, b) => b.endedAt - a.endedAt)
+  for (const a of ended.slice(AGENTS_KEPT)) agents.delete(a.id)
 }
+
+const agentGlyph = (a) => (a.status === 'running' ? ['●', C.teal] : a.status === 'done' ? ['✓', C.green] : a.status === 'failed' ? ['✗', C.red] : ['■', C.gray])
 
 // ------------------------------------------------------------------ render ---
 
@@ -340,6 +346,12 @@ function gitSegs() {
     if (!git.dirty && !git.ahead && !git.behind) s.push(seg('  ✅ clean', C.green, { pri: 1 }))
   } else s.push(seg('no git', C.gray))
   return s
+}
+
+// Pace as where the limit lands at the reset if use keeps this rate: pace 0.2× reads "~20% by reset".
+const paceSegs = (q, opts = {}) => {
+  const col = level(q.pace, PACE_WARN, PACE_CRIT)
+  return [seg('📈 ~' + Math.round(q.pace * 100) + '%', col, { bold: true, ...opts }), seg(' by reset', col, opts)]
 }
 
 const quotaStatusSeg = (q, opts = {}) =>
@@ -391,7 +403,7 @@ function compactLines($, now) {
       seg('  ' + String(Math.round(q.pct)).padStart(3) + '%', col, { bold: true }),
     ]
     if (q.resetsAt) row.push(seg('  🔄 ' + fmtClock(q.resetsAt, now), C.gray), seg(' (in ' + fmtDur(q.resetsAt - now) + ')', C.light, { pri: 2 }))
-    if (q.pace != null) row.push(seg('  pace ', C.gray, { pri: 3 }), seg(q.pace.toFixed(1) + '×', level(q.pace, PACE_WARN, PACE_CRIT), { bold: true, pri: 3 }))
+    if (q.pace != null) row.push(seg('  ', C.text, { pri: 3 }), ...paceSegs(q, { pri: 3 }))
     const st = quotaStatusSeg(q)
     if (st) row.push(seg('  ', C.text, { pri: st.pri }), st)
     L.push(row)
@@ -449,25 +461,17 @@ function sidebarLines($, now, W) {
     L.push(blank(), head(q.icon + ' ' + q.label + ' limit', C.text))
     L.push([seg(f, col), seg(e, C.light), seg('  ' + Math.round(q.pct) + '%', col, { bold: true })])
     if (q.resetsAt) L.push([seg('🔄 ' + fmtClock(q.resetsAt, now), C.gray), seg(' (in ' + fmtDur(q.resetsAt - now) + ')', C.light, { pri: 1 })])
-    if (q.pace != null) L.push([seg('pace ', C.gray), seg(q.pace.toFixed(1) + '×', level(q.pace, PACE_WARN, PACE_CRIT), { bold: true })])
+    if (q.pace != null) L.push(paceSegs(q))
     const st = quotaStatusSeg(q, { pri: 0 })
     if (st) L.push([st])
   }
 
-  if (agents.size) {
-    const run = runningAgents()
-    L.push(blank(), head('👥 Agents' + (run.length ? ' (' + run.length + ' running)' : ''), C.teal))
-    const list = [...agents.values()].sort((a, b) => (a.status === 'running' ? 0 : 1) - (b.status === 'running' ? 0 : 1) || b.spawnedAt - a.spawnedAt).slice(0, 6)
-    for (const a of list) {
-      const glyph = a.status === 'running' ? ['●', C.teal] : a.status === 'done' ? ['✓', C.green] : a.status === 'failed' ? ['✗', C.red] : ['■', C.gray]
-      const r = [seg(' ' + glyph[0] + ' ', glyph[1], { bold: true }), seg(shorten(a.name, 14).padEnd(14), C.text)]
-      if (a.status === 'running') {
-        if (a.ctxTokens) r.push(seg(' ' + fmtTokens(a.ctxTokens) + ' ctx', C.teal, { pri: 1 }))
-        if (a.outTokens) r.push(seg(' · ' + fmtTokens(a.outTokens) + ' out', C.teal, { pri: 2 }))
-        r.push(seg(' · ' + fmtDur(now - a.spawnedAt), C.gray, { pri: 3 }))
-      } else r.push(seg(' ' + a.status + ' · ' + fmtDur((a.endedAt ?? now) - a.spawnedAt), C.gray, { pri: 1 }))
-      L.push(r)
-    }
+  // The rows are the Agents tab's; here only who is running.
+  const run = runningAgents()
+  if (run.length) {
+    const tok = run.reduce((n, a) => n + (a.ctxTokens ?? 0), 0)
+    L.push(blank(), head('👥 Agents', C.teal))
+    L.push([seg(run.length + ' running', C.teal, { bold: true }), seg(tok ? ' · ' + fmtTokens(tok) + ' ctx' : '', C.teal, { pri: 1 }), seg('  → Agents tab', C.gray, { pri: 2 })])
   }
 
   if (costUsd != null) {
@@ -494,6 +498,51 @@ function scriptsLines($, W) {
       seg(scriptsOthers.length + ' from other sessions  ', C.gray),
       btn('🧹 clean', 'clean', () => void cleanByHand($).catch(() => {})),
     ])
+  }
+  return L
+}
+
+// The Agents tab: the running ones on two rows each, the finished on one, newest first. Both
+// groups stay in sight: when rows run short the running ones take one row too, and the oldest
+// finished give way to an "older" count before they would fall below the pane's fold.
+function agentsLines(now, W, rows) {
+  if (!agents.size) return [[seg('No agents in this session yet.', C.gray)]]
+  const newest = (a, b) => b.spawnedAt - a.spawnedAt
+  const run = [...agents.values()].filter((a) => a.status === 'running').sort(newest)
+  const ended = [...agents.values()].filter((a) => a.status !== 'running').sort((a, b) => b.endedAt - a.endedAt)
+  const title = (a) => a.desc || a.name
+  const toks = (a, lead) => {
+    const t = []
+    if (a.ctxTokens) t.push(seg(lead + fmtTokens(a.ctxTokens) + ' ctx', C.gray, { pri: 2 }))
+    if (a.outTokens) t.push(seg((t.length ? ' · ' : lead) + fmtTokens(a.outTokens) + ' out', C.gray, { pri: 1 }))
+    return t
+  }
+  const L = []
+  if (run.length) {
+    L.push([seg('● ' + run.length + ' running', C.teal, { bold: true })])
+    // Two rows each unless that would push the finished ones out of the pane.
+    const tight = rows && 1 + run.length * 2 + (ended.length ? 2 + Math.min(ended.length, 3) : 0) > rows
+    for (const a of run) {
+      if (tight) {
+        L.push([seg(' ● ', C.teal, { bold: true }), seg(shorten(title(a), 18), C.text, { bold: true }), ...toks(a, ' · '), seg(' · ' + fmtDur(now - a.spawnedAt), C.teal, { pri: 3 })])
+        continue
+      }
+      L.push([seg(' ● ', C.teal, { bold: true }), seg(shorten(title(a), W - 3), C.text, { bold: true })])
+      const t = toks(a, '   ')
+      if (a.steps) t.push(seg(' · ' + a.steps + (a.steps === 1 ? ' step' : ' steps'), C.gray, { pri: 3 }))
+      L.push([...(t.length ? t : [seg('   ', C.gray)]), seg((t.length ? ' · ' : '') + fmtDur(now - a.spawnedAt), C.teal)])
+    }
+  }
+  if (ended.length) {
+    if (L.length) L.push(blank())
+    const room = rows ? Math.max(1, rows - L.length - 1) : ended.length
+    const shown = ended.length > room ? ended.slice(0, Math.max(0, room - 1)) : ended
+    L.push([seg('✓ ' + ended.length + ' finished', C.gray, { bold: true })])
+    for (const a of shown) {
+      const [g, gc] = agentGlyph(a)
+      L.push([seg(' ' + g + ' ', gc, { bold: true }), seg(shorten(title(a), 18), C.text), ...toks(a, ' · '), seg(' · ' + fmtDur(a.endedAt - a.spawnedAt), C.gray, { pri: 3 })])
+    }
+    if (shown.length < ended.length) L.push([seg('   +' + (ended.length - shown.length) + ' older', C.light)])
   }
   return L
 }
@@ -533,8 +582,17 @@ async function openScriptsPane($) {
   } catch {}
 }
 
+async function openAgentsPane($) {
+  if (agentsPaneOpen || agentsClosedByUser || !agents.size) return
+  try {
+    const r = await $.ui.open({ id: AGENTS_PANE, title: 'Agents', columns: PANE_COLUMNS, rows: PANE_ROWS })
+    agentsPaneOpen = r?.isPlaced !== false
+  } catch {}
+}
+
 async function openPane($) {
   await openScriptsPane($)
+  await openAgentsPane($)
   try {
     paneOpen = await $.ui.open({ id: PANE, title: 'Status', columns: PANE_COLUMNS, rows: PANE_ROWS })
   } catch (err) {
@@ -565,7 +623,7 @@ export function register(on) {
     })
     $.clock.every(TICK_MS, async () => {
       await pullUsage($)
-      pruneAgents(Date.now())
+      pruneAgents()
       $.ui.invalidate('ui.render')
     })
     try {
@@ -621,6 +679,7 @@ export function register(on) {
       agents.set(started.agentId, {
         id: started.agentId,
         name: String(e.name ?? e.subagentType ?? 'agent').split(':').pop(),
+        desc: e.description ? String(e.description) : null,
         status: 'running',
         spawnedAt: Date.now(),
         endedAt: null,
@@ -628,6 +687,8 @@ export function register(on) {
         outTokens: 0,
         steps: 0,
       })
+      // The dock is up: the agent gets its tab now rather than at the next open.
+      if (Date.now() - paneSeenAt < PANE_STALE_MS) void openAgentsPane($)
       $.ui.invalidate('ui.render')
     }
     return started
@@ -692,6 +753,10 @@ export function register(on) {
       scriptsPaneOpen = false
       if (e.origin?.kind === 'person') scriptsClosedByUser = true
     }
+    if (e.id === AGENTS_PANE) {
+      agentsPaneOpen = false
+      if (e.origin?.kind === 'person') agentsClosedByUser = true
+    }
     return next(e)
   }).catch(($, e, next) => next(e)) // an observer: a throw here must not stop the close
 
@@ -708,6 +773,13 @@ export function register(on) {
     paneSeenAt = Date.now() // the dock is on screen with Scripts as the tab on show
     const W = Math.max(24, (e.props?.bodyColumns ?? PANE_COLUMNS) - 1)
     return draw($, e, scriptsLines($, W), W)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: AGENTS_PANE }, async ($, e) => {
+    const now = Date.now()
+    paneSeenAt = now // the dock is on screen with Agents as the tab on show
+    const W = Math.max(24, (e.props?.bodyColumns ?? PANE_COLUMNS) - 1)
+    return draw($, e, agentsLines(now, W, e.props?.scroll?.bodyRows), W)
   })
 
   // Under the prompt: the compact view while neither dock tab is on screen. The pane is opened only
@@ -759,12 +831,15 @@ export function register(on) {
     if (verb === 'close') {
       paneClosedByUser = true
       scriptsClosedByUser = true
+      agentsClosedByUser = true
       await $.ui.close({ id: SCRIPTS_PANE }).catch(() => {})
+      await $.ui.close({ id: AGENTS_PANE }).catch(() => {})
       await $.ui.close({ id: PANE })
       return { text: 'statusband closed. The compact view stays under the prompt.' }
     }
     paneClosedByUser = false
     scriptsClosedByUser = false
+    agentsClosedByUser = false
     await refreshScripts($)
     const r = await openPane($)
     return { text: r?.isPlaced ? 'statusband opened.' : 'statusband is not shown yet: ' + (r?.reason ?? 'unknown') }

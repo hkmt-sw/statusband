@@ -71,6 +71,9 @@ test('docked pane draws the sidebar', async ($, on) => {
     } as any)
     expect(await ui.find({ type: 'Text', text: /Context/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /7d limit/ })).toBeDefined()
+    // 5h: 83% used with 188 of 300 minutes gone heads for ~132% at the reset.
+    expect(await ui.find({ type: 'Text', text: /~132%/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /pace/ })).toBeUndefined()
     await ui.unmount()
   }
 })
@@ -223,4 +226,65 @@ test('a script another session wrote stays out of this session\'s tab', async ($
   expect(await ui.find({ type: 'Text', text: /No scripts from this session yet/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /2 from other sessions/ })).toBeDefined()
   await ui.unmount()
+})
+
+// One agent that ran a step and finished, one still running.
+async function twoAgents($: any) {
+  await $.agent.spawn({ prompt: 'p', description: 'Audit the hooks', subagentType: 'general-purpose' })
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, agentId: 'a1', model: 'claude-opus-5-5', messageCount: 1 } as any)) void _
+  await $.turn.complete({ turnId: 't1', agentId: 'a1', reason: 'answer', answer: 'ok', durationMs: 1000 } as any)
+  await $.agent.spawn({ prompt: 'p', description: 'Scan the docs', subagentType: 'Explore' })
+}
+
+const agentBottoms = (opened?: string[]) => (on: any) => {
+  let n = 0
+  on('agent.spawn', async () => ({ model: 'claude-opus-5-5', agentId: 'a' + ++n }) as any)
+  on('turn.step', async function* (_$: any, e: any) {
+    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], usage: { input_tokens: 1000, cache_read_input_tokens: 127_000, output_tokens: 39_000 } } as any
+  })
+  on('turn.complete', async () => ({ text: 'ok' }) as any)
+  if (opened) on('ui.open', async (_$: any, e: any) => (opened.push(e.id), { value: { isPlaced: true } }) as any)
+}
+
+const AGENTS_TAB = {
+  plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband-agents',
+  props: { title: 'Agents', isFocused: false, bodyColumns: 44, placement: 'dock' },
+} as const
+
+test('the Agents tab keeps a finished agent\'s tokens; the status pane only counts who runs', async ($, on) => {
+  await setup($, on, undefined, agentBottoms())
+  await twoAgents($)
+  const tab = await $.ui.mount(AGENTS_TAB as any)
+  expect(await tab.find({ type: 'Text', text: /Audit the hooks/ })).toBeDefined()
+  expect(await tab.find({ type: 'Text', text: /128K ctx/ })).toBeDefined()
+  expect(await tab.find({ type: 'Text', text: /39K out/ })).toBeDefined()
+  expect(await tab.find({ type: 'Text', text: /Scan the docs/ })).toBeDefined()
+  await tab.unmount()
+  const pane = await $.ui.mount({
+    plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband',
+    props: { title: 'Status', isFocused: false, bodyColumns: 44, placement: 'dock' },
+  } as any)
+  expect(await pane.find({ type: 'Text', text: /1 running/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /Audit the hooks/ })).toBeUndefined()
+  await pane.unmount()
+})
+
+test('the Agents tab keeps finished agents in sight when the running ones fill it', async ($, on) => {
+  await setup($, on, undefined, agentBottoms())
+  await twoAgents($)
+  for (let i = 0; i < 6; i++) await $.agent.spawn({ prompt: 'p', description: 'Busy ' + i, subagentType: 'Explore' })
+  const tab = await $.ui.mount({ ...AGENTS_TAB, props: { ...AGENTS_TAB.props, scroll: { bodyRows: 12 } } } as any)
+  expect(await tab.find({ type: 'Text', text: /7 running/ })).toBeDefined()
+  expect(await tab.find({ type: 'Text', text: /1 finished/ })).toBeDefined()
+  expect(await tab.find({ type: 'Text', text: /Audit the hooks/ })).toBeDefined()
+  expect(await tab.findAll({ type: 'Box' }).then((b: any[]) => b.length)).toBeLessThanOrEqual(13) // the rows and the column holding them
+  await tab.unmount()
+})
+
+test('/statusband opens the Agents tab once there are agents, status last', async ($, on) => {
+  const opened: string[] = []
+  await setup($, on, undefined, agentBottoms(opened))
+  await twoAgents($)
+  await $.command.run({ command: 'statusband', args: '' } as any)
+  expect(opened).toEqual(['statusband-agents', 'statusband'])
 })
