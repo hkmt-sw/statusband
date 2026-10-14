@@ -15,8 +15,8 @@ import { num, fmtTokens, fmtDur, fmtUsd, fmtClock, dayKey, toMs, bar, shorten, p
 
 const PANE = 'statusband'
 const SCRIPTS_PANE = 'statusband-scripts' // its own tab beside the status pane
-const AGENTS_PANE = 'statusband-agents' // likewise
-const COSTS_PANE = 'statusband-costs' // cost, models, repos, tools
+const AGENTS_PANE = 'statusband-agents' // likewise: the Activity tab, agents and tools
+const COSTS_PANE = 'statusband-costs' // cost, models, repos
 const PANE_COLUMNS = 46
 const PANE_ROWS = 9
 const GIT_EVERY_MS = 15_000
@@ -37,8 +37,8 @@ const TREND_DAYS = 14 // the Costs tab's daily cost sparkline
 const REPORT_DAYS = 30 // /statusband report's default span
 const CACHE_WARN = 80 // cache share of the input below this is amber, below CACHE_CRIT red
 const CACHE_CRIT = 50
-const SHOWN_ROWS = 5 // repos and tools on the Costs tab
-const AGENTS_KEPT = 20 // finished ones the Agents tab keeps, newest first
+const SHOWN_ROWS = 5 // repos on the Costs tab, tools on the Activity tab
+const AGENTS_KEPT = 20 // finished ones the Activity tab keeps, newest first
 const SCRIPTS_DIR = '.scripts' // in the working directory; ignores itself in git
 const SCRIPTS_SHOWN = 5
 const SCRIPTS_KEEP_MS = 7 * 86_400_000 // other sessions' scripts older than this go at session start
@@ -619,12 +619,12 @@ function sidebarLines($, now, W) {
     if (st) L.push([st])
   }
 
-  // The rows are the Agents tab's; here only who is running.
+  // The rows are the Activity tab's; here only who is running.
   const run = runningAgents()
   if (run.length) {
     const tok = run.reduce((n, a) => n + (a.ctxTokens ?? 0), 0)
     L.push(blank(), head('👥 Agents', C.teal))
-    L.push([seg(run.length + ' running', C.teal, { bold: true }), seg(tok ? ' · ' + fmtTokens(tok) + ' ctx' : '', C.teal, { pri: 1 }), seg('  → Agents tab', C.gray, { pri: 2 })])
+    L.push([seg(run.length + ' running', C.teal, { bold: true }), seg(tok ? ' · ' + fmtTokens(tok) + ' ctx' : '', C.teal, { pri: 1 }), seg('  → Activity tab', C.gray, { pri: 2 })])
   }
 
   // The details are the Costs tab's; here only the totals.
@@ -640,7 +640,7 @@ function sidebarLines($, now, W) {
   return L
 }
 
-// The Costs tab: cost and its trend, cache share, models, repos, tools.
+// The Costs tab: cost and its trend, cache share, models, repos.
 function costsLines(now, W) {
   const L = []
   const head = (t) => [seg(t, C.text, { bold: true })]
@@ -681,14 +681,6 @@ function costsLines(now, W) {
       L.push([seg(shorten(r.repo, 16), C.blue, { bold: true }), seg(' · ' + fmtUsd(r.cost), C.green), seg(' · ' + fmtDur(r.ms), C.gray, { pri: 1 }), seg(' · ' + fmtTokens(r.out) + ' out', C.light, { pri: 2 })])
     }
     if (repoUse.length > SHOWN_ROWS) L.push([seg('+' + (repoUse.length - SHOWN_ROWS) + ' more', C.light)])
-  }
-
-  const tools = Object.entries(toolUse).sort((a, b) => b[1].ms - a[1].ms)
-  if (tools.length) {
-    L.push(blank(), head('🔧 Tools · session'))
-    for (const [t, r] of tools.slice(0, SHOWN_ROWS)) {
-      L.push([seg(shorten(t, 14), C.text), seg(' ' + r.n + '×', C.gray), seg(' · ' + fmtDur(r.ms), C.gray), ...(r.err ? [seg(' · ' + r.err + ' err', C.red, { pri: 1 })] : [])])
-    }
   }
 
   L.push(blank(), [seg('/statusband report → CSV', C.light, { pri: 1 })])
@@ -740,11 +732,26 @@ function scriptsLines($, W) {
   return L
 }
 
-// The Agents tab: the running ones on two rows each, the finished on one, newest first. Both
+// The Activity tab's agents: the running ones on two rows each, the finished on one, newest first. Both
 // groups stay in sight: when rows run short the running ones take one row too, and the oldest
 // finished give way to an "older" count before they would fall below the pane's fold.
+function activityLines(now, W, rows) {
+  const tools = Object.entries(toolUse).sort((a, b) => b[1].ms - a[1].ms).slice(0, SHOWN_ROWS)
+  if (!agents.size && !tools.length) return [[seg('No agents or tool calls in this session yet.', C.gray)]]
+  // The tools keep their rows at the bottom; the agents fold into the rest.
+  const toolRows = tools.length ? tools.length + (agents.size ? 2 : 1) : 0
+  const L = agents.size ? agentsLines(now, W, rows ? Math.max(4, rows - toolRows) : rows) : []
+  if (tools.length) {
+    if (L.length) L.push(blank())
+    L.push([seg('🔧 Tools · session', C.text, { bold: true })])
+    for (const [t, r] of tools) {
+      L.push([seg(shorten(t, 14), C.text), seg(' ' + r.n + '×', C.gray), seg(' · ' + fmtDur(r.ms), C.gray), ...(r.err ? [seg(' · ' + r.err + ' err', C.red, { pri: 1 })] : [])])
+    }
+  }
+  return L
+}
+
 function agentsLines(now, W, rows) {
-  if (!agents.size) return [[seg('No agents in this session yet.', C.gray)]]
   const newest = (a, b) => b.spawnedAt - a.spawnedAt
   const run = [...agents.values()].filter((a) => a.status === 'running').sort(newest)
   const ended = [...agents.values()].filter((a) => a.status !== 'running').sort((a, b) => b.endedAt - a.endedAt)
@@ -821,9 +828,9 @@ async function openScriptsPane($) {
 }
 
 async function openAgentsPane($) {
-  if (agentsPaneOpen || agentsClosedByUser || !agents.size) return
+  if (agentsPaneOpen || agentsClosedByUser || (!agents.size && !Object.keys(toolUse).length)) return
   try {
-    const r = await $.ui.open({ id: AGENTS_PANE, title: 'Agents', columns: PANE_COLUMNS, rows: PANE_ROWS })
+    const r = await $.ui.open({ id: AGENTS_PANE, title: 'Activity', columns: PANE_COLUMNS, rows: PANE_ROWS })
     agentsPaneOpen = r?.isPlaced !== false
   } catch {}
 }
@@ -988,8 +995,11 @@ export function register(on) {
     const done = await next(e)
     if (done?.deny === undefined && e.tool) {
       const ms = Date.now() - t0
+      const first = !Object.keys(toolUse).length
       toolUse = addToolUse(toolUse, String(e.tool), ms, !!done?.isError)
       if (!e.agentId) turnToolMs += ms
+      // The first tool call brings up the Activity tab, as the first agent does.
+      if (first && Date.now() - paneSeenAt < PANE_STALE_MS) void openAgentsPane($)
     }
     if (SCRIPT_WRITERS.includes(e.tool) && done?.deny === undefined && !done?.isError) {
       try {
@@ -1051,9 +1061,9 @@ export function register(on) {
 
   on('ui.render', { component: 'Pane', requestId: AGENTS_PANE }, async ($, e) => {
     const now = Date.now()
-    paneSeenAt = now // the dock is on screen with Agents as the tab on show
+    paneSeenAt = now // the dock is on screen with Activity as the tab on show
     const W = Math.max(24, (e.props?.bodyColumns ?? PANE_COLUMNS) - 1)
-    return draw($, e, agentsLines(now, W, e.props?.scroll?.bodyRows), W)
+    return draw($, e, activityLines(now, W, e.props?.scroll?.bodyRows), W)
   })
 
   on('ui.render', { component: 'Pane', requestId: COSTS_PANE }, async ($, e) => {

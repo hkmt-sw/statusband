@@ -257,10 +257,10 @@ const COSTS_TAB = {
 
 const AGENTS_TAB = {
   plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband-agents',
-  props: { title: 'Agents', isFocused: false, bodyColumns: 44, placement: 'dock' },
+  props: { title: 'Activity', isFocused: false, bodyColumns: 44, placement: 'dock' },
 } as const
 
-test('the Agents tab keeps a finished agent\'s tokens; the status pane only counts who runs', async ($, on) => {
+test('the Activity tab keeps a finished agent\'s tokens; the status pane only counts who runs', async ($, on) => {
   await setup($, on, undefined, agentBottoms())
   await twoAgents($)
   const tab = await $.ui.mount(AGENTS_TAB as any)
@@ -278,7 +278,7 @@ test('the Agents tab keeps a finished agent\'s tokens; the status pane only coun
   await pane.unmount()
 })
 
-test('the Agents tab keeps finished agents in sight when the running ones fill it', async ($, on) => {
+test('the Activity tab keeps finished agents in sight when the running ones fill it', async ($, on) => {
   await setup($, on, undefined, agentBottoms())
   await twoAgents($)
   for (let i = 0; i < 6; i++) await $.agent.spawn({ prompt: 'p', description: 'Busy ' + i, subagentType: 'Explore' })
@@ -290,7 +290,7 @@ test('the Agents tab keeps finished agents in sight when the running ones fill i
   await tab.unmount()
 })
 
-test('/statusband opens the Agents tab once there are agents, status last', async ($, on) => {
+test('/statusband opens the Activity tab once there are agents, status last', async ($, on) => {
   const opened: string[] = []
   await setup($, on, undefined, agentBottoms(opened))
   await twoAgents($)
@@ -341,7 +341,7 @@ test('tokens and time add up by model, for the session and the day', async ($, o
   expect(r.text).toContain('    Sonnet 5.5: 2K in')
 })
 
-test('cost lives on the Costs tab: cache share, tools; the status pane keeps the totals', async ($, on) => {
+test('cost lives on the Costs tab, tools on the Activity tab; the status pane keeps the totals', async ($, on) => {
   await setup($, on, undefined, (on: any) => {
     agentBottoms()(on)
     on('tool.call', async () => ({ result: { text: 'ok' } }) as any)
@@ -355,9 +355,14 @@ test('cost lives on the Costs tab: cache share, tools; the status pane keeps the
   expect(await tab.find({ type: 'Text', text: /\$3\.21/ })).toBeDefined()
   expect(await tab.find({ type: 'Text', text: /99%/ })).toBeDefined() // 127K cached of 128K
   expect(await tab.find({ type: 'Text', text: /1 of 14d/ })).toBeDefined() // the trend shows from the first day
-  expect(await tab.find({ type: 'Text', text: /Tools · session/ })).toBeDefined()
-  expect(await tab.find({ type: 'Text', text: / 2×/ })).toBeDefined()
+  expect(await tab.find({ type: 'Text', text: /Tools · session/ })).toBeUndefined()
   await tab.unmount()
+  // The tools are on the Activity tab, there even with no agents.
+  const act = await $.ui.mount(AGENTS_TAB as any)
+  expect(await act.find({ type: 'Text', text: /Tools · session/ })).toBeDefined()
+  expect(await act.find({ type: 'Text', text: / 2×/ })).toBeDefined()
+  expect(await act.find({ type: 'Text', text: /No agents/ })).toBeUndefined()
+  await act.unmount()
   const pane = await $.ui.mount({
     plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband',
     props: { title: 'Status', isFocused: false, bodyColumns: 44, placement: 'dock' },
