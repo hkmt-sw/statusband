@@ -1,0 +1,6 @@
+{
+  "name": "statusband",
+  "version": "0.1.0",
+  "description": "Colorful status sidebar, or a compact view under the prompt: state, model, repo, context, plan limits, cost",
+  "author": { "name": "Tamas" }
+}

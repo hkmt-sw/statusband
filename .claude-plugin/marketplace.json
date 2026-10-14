@@ -1,0 +1,14 @@
+{
+  "name": "statusband",
+  "description": "statusband, a Claude Code status sidebar mod",
+  "owner": {
+    "name": "hkmt-sw"
+  },
+  "plugins": [
+    {
+      "name": "statusband",
+      "source": "./",
+      "description": "Colorful status sidebar, or a compact view under the prompt: state, model, repo, context, plan limits, cost"
+    }
+  ]
+}
