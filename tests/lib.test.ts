@@ -162,16 +162,17 @@ test('scriptName: only files directly in the folder', async () => {
   expect(scriptName(null, '/w/.scripts/a.sh')).toBe(null)
 })
 
-test('ownScripts: claims, then fresh unclaimed files, belong to the session', async () => {
-  const files = [{ name: 'new.sh', mtimeMs: 200 }, { name: 'theirs.sh', mtimeMs: 300 }, { name: 'mine.sh', mtimeMs: 50 }, { name: 'orphan.sh', mtimeMs: 10 }]
-  const r = ownScripts(files, { 'theirs.sh': 'B', 'mine.sh': 'A' }, 'A', 100)
+test('ownScripts: claims, then fresh unclaimed files, belong to the session; the rest are orphans', async () => {
+  const files = [{ name: 'new.sh', mtimeMs: 200 }, { name: 'theirs.sh', mtimeMs: 300 }, { name: 'wrote.sh', mtimeMs: 20 }, { name: 'mine.sh', mtimeMs: 50 }, { name: 'orphan.sh', mtimeMs: 10 }]
+  const r = ownScripts(files, { 'theirs.sh': 'B', 'wrote.sh': { session: 'B', wrote: true }, 'mine.sh': { session: 'A', wrote: true } }, 'A', 100)
   expect(r.mine.map((f) => f.name)).toEqual(['new.sh', 'mine.sh'])
-  expect(r.others.map((f) => f.name)).toEqual(['theirs.sh', 'orphan.sh'])
+  expect(r.others.map((f) => [f.name, f.written])).toEqual([['theirs.sh', false], ['wrote.sh', true]])
+  expect(r.orphans.map((f) => f.name)).toEqual(['orphan.sh'])
   expect(r.claims).toEqual({ 'new.sh': 'A' })
 })
 
-test('staleScripts: grace by hand, age limit at start-up', async () => {
-  const others = [{ name: 'fresh', mtimeMs: 990 }, { name: 'day', mtimeMs: 500 }, { name: 'old', mtimeMs: 0 }]
+test('staleScripts: only what Claude wrote; grace by hand, age limit at start-up', async () => {
+  const others = [{ name: 'fresh', mtimeMs: 990, written: true }, { name: 'day', mtimeMs: 500, written: true }, { name: 'old', mtimeMs: 0, written: true }, { name: 'seen', mtimeMs: 0, written: false }]
   expect(staleScripts(others, 1000, 100)).toEqual(['day', 'old'])
   expect(staleScripts(others, 1000, 100, 600)).toEqual(['old'])
 })

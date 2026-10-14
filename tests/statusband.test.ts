@@ -11,7 +11,7 @@ const USAGE = {
   cost: { usd: 3.21 },
 }
 
-async function setup($: any, on: any, toast?: (...a: any[]) => Promise<any>, before?: (on: any) => void, opts: { removed?: string[][]; owners?: Record<string, string> } = {}) {
+async function setup($: any, on: any, toast?: (...a: any[]) => Promise<any>, before?: (on: any) => void, opts: { removed?: string[][]; owners?: Record<string, unknown> } = {}) {
   mock.clock(on, { now })
   if (!opts.owners) mock.store(on)
   else {
@@ -94,15 +94,19 @@ test('context toast fires again after usage drops below the level', async ($, on
   expect(ctxToasts()).toBe(2)
 })
 
-// A .scripts folder with two scripts, the newer written during the session.
+// A .scripts folder with two scripts, the newer written during the session. old.py is another
+// session's, written by Claude there (OLD_PY_OWNER), unless a test leaves it unclaimed.
 const SCRIPTS: Record<string, { text: string; mtimeMs: number }> = {
   'deploy.sh': { text: '#!/bin/bash\n# Deploy the demo to staging\necho deploy\n', mtimeMs: now - 60_000 },
   'old.py': { text: '# Old helper\nprint(1)\n', mtimeMs: now - 3 * 86_400_000 },
 }
 
-function scriptFs(log: { fills: string[]; copies: string[]; writes: string[] }) {
+const OLD_PY_OWNER = { owners: { 'old.py': { session: 'other-session', wrote: true } } }
+
+function scriptFs(log: { fills: string[]; copies: string[]; writes: string[] }, isLink = false) {
   return (on: any) => {
     const answer = (f: (e: any) => unknown) => async (_$: any, e: any) => ({ value: f(e) }) as any
+    on('fs.stat', answer(() => ({ kind: 'dir', size: 0, mtimeMs: now, isLink })))
     on('fs.exists', answer((e) => ['/work/demo/.scripts', '/work/demo/.scripts/deploy.sh', '/work/demo/.scripts/old.py'].includes(e.path)))
     on('fs.list', answer(() => [
       ...Object.entries(SCRIPTS).map(([name, f]) => ({ name, kind: 'file', size: f.text.length, mtimeMs: f.mtimeMs, isLink: false })),
@@ -117,7 +121,7 @@ function scriptFs(log: { fills: string[]; copies: string[]; writes: string[] }) 
 
 test('the Scripts tab lists scripts; run fills the prompt, copy puts the file on the clipboard', async ($, on) => {
   const log = { fills: [] as string[], copies: [] as string[], writes: [] as string[] }
-  await setup($, on, undefined, scriptFs(log))
+  await setup($, on, undefined, scriptFs(log), OLD_PY_OWNER)
   expect(log.writes).toContain('/work/demo/.scripts/.gitignore')
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({
@@ -163,7 +167,7 @@ test('compact view offers the newest script of the session', async ($, on) => {
 
 test('/statusband copy and run pick a script by name', async ($, on) => {
   const log = { fills: [] as string[], copies: [] as string[], writes: [] as string[] }
-  await setup($, on, undefined, scriptFs(log))
+  await setup($, on, undefined, scriptFs(log), OLD_PY_OWNER)
   const copied = await $.command.run({ command: 'statusband', args: 'copy old' } as any)
   expect(JSON.stringify(copied)).toContain('old.py')
   expect(log.copies).toEqual([SCRIPTS['old.py'].text])
@@ -205,7 +209,7 @@ const SCRIPTS_TAB = {
 test('the Scripts tab shows this session\'s scripts; other sessions\' only as a count to clean', async ($, on) => {
   const log = { fills: [] as string[], copies: [] as string[], writes: [] as string[] }
   const removed: string[][] = []
-  await setup($, on, undefined, scriptFs(log), { removed })
+  await setup($, on, undefined, scriptFs(log), { removed, ...OLD_PY_OWNER })
   expect(removed).toEqual([]) // old.py is 3 days old: the start-up cleaner keeps a week
   const ui = await $.ui.mount(SCRIPTS_TAB as any)
   expect(await ui.find({ type: 'Text', text: /deploy\.sh/ })).toBeDefined()
@@ -221,7 +225,7 @@ test('the Scripts tab shows this session\'s scripts; other sessions\' only as a 
 
 test('a script another session wrote stays out of this session\'s tab', async ($, on) => {
   const log = { fills: [] as string[], copies: [] as string[], writes: [] as string[] }
-  await setup($, on, undefined, scriptFs(log), { owners: { 'deploy.sh': 'other-session' } })
+  await setup($, on, undefined, scriptFs(log), { owners: { 'deploy.sh': 'other-session', ...OLD_PY_OWNER.owners } })
   const ui = await $.ui.mount(SCRIPTS_TAB as any)
   expect(await ui.find({ type: 'Text', text: /No scripts from this session yet/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /2 from other sessions/ })).toBeDefined()
@@ -287,4 +291,26 @@ test('/statusband opens the Agents tab once there are agents, status last', asyn
   await twoAgents($)
   await $.command.run({ command: 'statusband', args: '' } as any)
   expect(opened).toEqual(['statusband-agents', 'statusband'])
+})
+
+test('files no session claims are the person\'s own: never deleted, no .gitignore written', async ($, on) => {
+  const log = { fills: [] as string[], copies: [] as string[], writes: [] as string[] }
+  const removed: string[][] = []
+  await setup($, on, undefined, scriptFs(log), { removed })
+  const r = await $.command.run({ command: 'statusband', args: 'clean' } as any)
+  expect(JSON.stringify(r)).toContain('No scripts of other sessions to remove')
+  expect(removed).toEqual([])
+  expect(log.writes).not.toContain('/work/demo/.scripts/.gitignore')
+})
+
+test('a .scripts that is a link is left alone', async ($, on) => {
+  const log = { fills: [] as string[], copies: [] as string[], writes: [] as string[] }
+  const removed: string[][] = []
+  await setup($, on, undefined, scriptFs(log, true), { removed, ...OLD_PY_OWNER })
+  await $.command.run({ command: 'statusband', args: 'clean' } as any)
+  expect(removed).toEqual([])
+  expect(log.writes).toEqual([])
+  const ui = await $.ui.mount(SCRIPTS_TAB as any)
+  expect(await ui.find({ type: 'Text', text: /No scripts from this session yet/ })).toBeDefined()
+  await ui.unmount()
 })

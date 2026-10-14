@@ -9,7 +9,7 @@
 // Layout ideas (docked/inline modes, agent rows, last-turn receipt) were inspired by
 // scasella/claude-flightdeck (MIT); no code was copied.
 
-import { num, fmtTokens, fmtDur, fmtUsd, fmtClock, dayKey, toMs, bar, shorten, prettyModel, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts } from './lib.js'
+import { num, fmtTokens, fmtDur, fmtUsd, fmtClock, dayKey, toMs, bar, shorten, prettyModel, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts, ownerOf } from './lib.js'
 
 // ---------------------------------------------------------------- settings ---
 
@@ -35,6 +35,8 @@ const SCRIPTS_DIR = '.scripts' // in the working directory; ignores itself in gi
 const SCRIPTS_SHOWN = 5
 const SCRIPTS_KEEP_MS = 7 * 86_400_000 // other sessions' scripts older than this go at session start
 const SCRIPTS_GRACE_MS = 15 * 60_000 // /statusband clean spares other sessions' scripts this fresh
+// A repo's own config must not run anything on our git status: no fsmonitor hook.
+const GIT_SAFE = ['-c', 'core.fsmonitor=false']
 const SCRIPT_WRITERS = ['Write', 'Edit', 'MultiEdit', 'NotebookEdit']
 
 // Asks the model to hand the person scripts as files the band can run or copy.
@@ -85,7 +87,7 @@ let paneFailedAt = 0 // when $.ui.open last threw; tried again after PANE_RETRY_
 let panePlacement = null
 let lastStepKeys = []
 let scripts = [] // this session's, newest first: [{ name, desc, mtimeMs }]
-let scriptsOthers = [] // other sessions' files in the folder: [{ name, mtimeMs }]
+let scriptsOthers = [] // other sessions' files in the folder: [{ name, mtimeMs, written }]
 let sessionId = null
 let sessionSeenAt = Date.now() // fallback start when usage has no startedAt
 let scriptsDir = null // <session cwd>/.scripts, absolute
@@ -103,12 +105,12 @@ const level = (v, warn, crit) => (v >= crit ? C.red : v >= warn ? C.amber : C.gr
 async function refreshGit($) {
   try {
     const cwd = await $.session.cwd()
-    const st = await $.process.run(['git', '--no-optional-locks', '-C', cwd, 'status', '--porcelain=v2', '--branch'])
+    const st = await $.process.run(['git', ...GIT_SAFE, '--no-optional-locks', '-C', cwd, 'status', '--porcelain=v2', '--branch'])
     if (st.exitCode !== 0) {
       git = { repo: cwd.split('/').filter(Boolean).pop() ?? cwd, branch: null }
       return
     }
-    const top = await $.process.run(['git', '-C', cwd, 'rev-parse', '--show-toplevel'])
+    const top = await $.process.run(['git', ...GIT_SAFE, '-C', cwd, 'rev-parse', '--show-toplevel'])
     const g = { repo: top.stdout.trim().split('/').pop(), branch: null, dirty: 0, ahead: 0, behind: 0 }
     for (const line of st.stdout.split('\n')) {
       if (line.startsWith('# branch.head ')) g.branch = line.slice(14).trim()
@@ -137,7 +139,7 @@ async function claimScript($, path) {
   const name = scriptName(await scriptsFolder($), path)
   if (!name) return
   const owners = (await $.store.get(ownersKey())) ?? {}
-  if (owners[name] !== sessionId) await $.store.set(ownersKey(), { ...owners, [name]: sessionId })
+  if (owners[name]?.wrote !== true || ownerOf(owners[name]) !== sessionId) await $.store.set(ownersKey(), { ...owners, [name]: { session: sessionId, wrote: true } })
 }
 
 async function refreshScripts($) {
@@ -148,16 +150,23 @@ async function refreshScripts($) {
       scriptsOthers = []
       return
     }
-    if (!(await $.fs.exists(dir + '/.gitignore'))) await $.fs.write(dir + '/.gitignore', '*\n')
+    // A linked folder leads somewhere else: it is left alone, nothing listed, written or deleted.
+    if ((await $.fs.stat(dir)).isLink) {
+      scripts = []
+      scriptsOthers = []
+      return
+    }
     const files = (await $.fs.list(dir))
       .filter((f) => f.kind === 'file' && !f.name.startsWith('.'))
       .sort((a, b) => b.mtimeMs - a.mtimeMs)
     const owners = (await $.store.get(ownersKey())) ?? {}
-    const { mine, others, claims } = ownScripts(files, owners, sessionId, startedAt ?? sessionSeenAt)
+    const { mine, others, orphans, claims } = ownScripts(files, owners, sessionId, startedAt ?? sessionSeenAt)
+    // A folder with files no session claims is the person's own: no .gitignore goes into it.
+    if (!orphans.length && !(await $.fs.exists(dir + '/.gitignore'))) await $.fs.write(dir + '/.gitignore', '*\n')
     // Claims of files gone from the folder are dropped.
     const kept = Object.fromEntries(Object.entries({ ...owners, ...claims }).filter(([n]) => files.some((f) => f.name === n)))
     if (JSON.stringify(kept) !== JSON.stringify(owners)) await $.store.set(ownersKey(), kept)
-    scriptsOthers = others.map((f) => ({ name: f.name, mtimeMs: f.mtimeMs }))
+    scriptsOthers = others.map((f) => ({ name: f.name, mtimeMs: f.mtimeMs, written: f.written }))
     scripts = await Promise.all(
       mine.slice(0, SCRIPTS_SHOWN).map(async (f) => ({ name: f.name, mtimeMs: f.mtimeMs, desc: scriptDesc(await $.fs.read(dir + '/' + f.name).catch(() => '')) })),
     )
@@ -865,8 +874,10 @@ export function register(on) {
     const json = JSON.stringify(dump, null, 2)
     let saved = ''
     try {
-      await $.fs.write('statusband-debug.json', json)
-      saved = 'Saved to statusband-debug.json in the working directory.\n'
+      // The temp folder, not the working directory, where a commit could pick it up.
+      const path = String((await $.env.get('TMPDIR').catch(() => null)) || '/tmp').replace(/\/+$/, '') + '/statusband-debug.json'
+      await $.fs.write(path, json)
+      saved = 'Saved to ' + path + '\n'
     } catch {}
     return { text: saved + '```json\n' + json.slice(0, 9000) + '\n```' }
   })

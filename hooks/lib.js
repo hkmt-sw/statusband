@@ -163,21 +163,29 @@ export const scriptName = (dir, path) => {
   return name && !name.includes('/') && !name.startsWith('.') ? name : null
 }
 
+// Who a file belongs to. A claim is the session id when the session only saw the file change, or
+// { session, wrote: true } when Claude wrote it with a file tool there; only those may be deleted.
+export const ownerOf = (claim) => (typeof claim === 'string' ? claim : (claim?.session ?? null))
+
 // Splits the folder's files between this session and the rest. A file no session claims is this
-// session's when it changed after the session started (written by a shell, say), else an orphan.
+// session's when it changed after the session started (written by a shell, say), else an orphan:
+// the person's own, or older than any claim, and never deleted.
 export const ownScripts = (files, owners, session, since) => {
   const mine = []
   const others = []
+  const orphans = []
   const claims = {}
   for (const f of files) {
-    let o = owners[f.name]
+    let o = ownerOf(owners[f.name])
     if (!o && since != null && f.mtimeMs >= since) o = claims[f.name] = session
-    ;(o === session ? mine : others).push(f)
+    if (o === session) mine.push(f)
+    else if (o) others.push({ ...f, written: owners[f.name]?.wrote === true })
+    else orphans.push(f)
   }
-  return { mine, others, claims }
+  return { mine, others, orphans, claims }
 }
 
-// Other sessions' scripts the cleaner may delete: untouched for graceMs (a session running beside
-// this one may still use a newer one), and with maxAgeMs, only those older than that.
+// Other sessions' scripts the cleaner may delete: written by Claude, untouched for graceMs (a
+// session running beside this one may still use a newer one), and with maxAgeMs only older ones.
 export const staleScripts = (others, now, graceMs, maxAgeMs) =>
-  others.filter((f) => now - f.mtimeMs >= (maxAgeMs ?? graceMs)).map((f) => f.name)
+  others.filter((f) => f.written && now - f.mtimeMs >= (maxAgeMs ?? graceMs)).map((f) => f.name)

@@ -1,6 +1,12 @@
 {
   "name": "statusband",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Colorful status sidebar, or a compact view under the prompt: state, model, repo, context, plan limits, cost",
-  "author": { "name": "Tamas" }
+  "author": {
+    "name": "Márton Tamás",
+    "url": "https://github.com/hkmt-sw"
+  },
+  "homepage": "https://github.com/hkmt-sw/statusband",
+  "repository": "https://github.com/hkmt-sw/statusband",
+  "license": "MIT"
 }
