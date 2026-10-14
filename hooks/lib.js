@@ -189,3 +189,31 @@ export const ownScripts = (files, owners, session, since) => {
 // session running beside this one may still use a newer one), and with maxAgeMs only older ones.
 export const staleScripts = (others, now, graceMs, maxAgeMs) =>
   others.filter((f) => f.written && now - f.mtimeMs >= (maxAgeMs ?? graceMs)).map((f) => f.name)
+
+// Per-model use: { [model]: { in, cached, out, ms, steps } }. `in` is the input sent fresh
+// (cache writes included); `cached` the input read back from the cache.
+export const addModelUse = (table, model, u, ms) => {
+  const r = table[model] ?? { in: 0, cached: 0, out: 0, ms: 0, steps: 0 }
+  return {
+    ...table,
+    [model]: {
+      in: r.in + (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
+      cached: r.cached + (u.cache_read_input_tokens ?? 0),
+      out: r.out + (u.output_tokens ?? 0),
+      ms: r.ms + Math.max(0, ms ?? 0),
+      steps: r.steps + 1,
+    },
+  }
+}
+
+// Adds up tables (one per session, or one per day), the busiest model first.
+export const sumModelUse = (tables) => {
+  const out = {}
+  for (const t of tables) {
+    for (const [m, r] of Object.entries(t ?? {})) {
+      const o = out[m] ?? { in: 0, cached: 0, out: 0, ms: 0, steps: 0 }
+      out[m] = { in: o.in + r.in, cached: o.cached + r.cached, out: o.out + r.out, ms: o.ms + r.ms, steps: o.steps + r.steps }
+    }
+  }
+  return Object.fromEntries(Object.entries(out).sort((a, b) => b[1].out - a[1].out))
+}

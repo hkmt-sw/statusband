@@ -5,11 +5,11 @@
 //   drawn at the PromptHint site, with the engine's own hint line kept above it.
 //
 // No network calls. Data comes from mods API events, local `git`, and this plugin's own $.store
-// (a daily cost ledger and plan-limit samples for the run-out forecast).
+// (a daily cost ledger, per-model tokens and time by day, and plan-limit samples for the run-out forecast).
 // Layout ideas (docked/inline modes, agent rows, last-turn receipt) were inspired by
 // scasella/claude-flightdeck (MIT); no code was copied.
 
-import { num, fmtTokens, fmtDur, fmtUsd, fmtClock, dayKey, toMs, bar, shorten, prettyModel, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts, ownerOf } from './lib.js'
+import { num, fmtTokens, fmtDur, fmtUsd, fmtClock, dayKey, toMs, bar, shorten, prettyModel, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts, ownerOf, addModelUse, sumModelUse } from './lib.js'
 
 // ---------------------------------------------------------------- settings ---
 
@@ -30,6 +30,8 @@ const PACE_WARN = 0.9
 const PACE_CRIT = 1.1
 const TOAST_LEVELS = [80, 95]
 const LEDGER_DAYS = 35
+const MODEL_DAYS = 7 // /statusband models adds up this many days
+const SESSIONS_SHOWN = 15 // and lists this many sessions, newest first
 const AGENTS_KEPT = 20 // finished ones the Agents tab keeps, newest first
 const SCRIPTS_DIR = '.scripts' // in the working directory; ignores itself in git
 const SCRIPTS_SHOWN = 5
@@ -95,6 +97,11 @@ let scriptsPaneOpen = false
 let scriptsClosedByUser = false
 let agentsPaneOpen = false
 let agentsClosedByUser = false
+let modelsSession = {} // per model, this session: { in, cached, out, ms, steps }
+let modelsMine = {} // likewise, this session's share of today
+let modelsToday = {} // every session's today, added up
+let modelsDay = null // the day modelsMine counts
+let sessionNamed = false // this session's name is in the store, for /statusband models
 
 // ----------------------------------------------------------------- helpers ---
 
@@ -232,10 +239,61 @@ async function recordCost($, now) {
   costToday = cur + Math.max(0, delta)
 }
 
+// A model call's tokens and time, kept by session within the day, so sessions do not
+// overwrite each other's counts. A resumed session picks up its share where it left it.
+async function recordModelUse($, m, usage, ms) {
+  if (!m || !usage) return
+  modelsSession = addModelUse(modelsSession, m, usage, ms)
+  const day = dayKey(Date.now())
+  const key = 'models:' + day
+  const all = (await $.store.get(key)) ?? {}
+  if (modelsDay !== day) {
+    modelsDay = day
+    modelsMine = (sessionId && all[sessionId]) || {}
+  }
+  modelsMine = addModelUse(modelsMine, m, usage, ms)
+  if (!sessionId) {
+    modelsToday = sumModelUse([...Object.values(all), modelsMine])
+    return
+  }
+  const next = { ...all, [sessionId]: modelsMine }
+  await $.store.set(key, next)
+  if (!sessionNamed) {
+    sessionNamed = true
+    await $.store.set('session:' + sessionId, { repo: git?.repo ?? null, startedAt: startedAt ?? sessionSeenAt })
+  }
+  modelsToday = sumModelUse(Object.values(next))
+}
+
+async function modelsOver($, days, now) {
+  const tables = []
+  for (let i = 0; i < days; i++) tables.push(...Object.values((await $.store.get('models:' + dayKey(now - i * 86400_000))) ?? {}))
+  return sumModelUse(tables)
+}
+
+// The last days by session, the newest session first: [{ id, repo, startedAt, use }].
+async function sessionsOver($, days, now) {
+  const by = {}
+  for (let i = 0; i < days; i++) {
+    for (const [sid, t] of Object.entries((await $.store.get('models:' + dayKey(now - i * 86400_000))) ?? {})) (by[sid] ??= []).push(t)
+  }
+  const out = []
+  for (const [sid, tables] of Object.entries(by)) {
+    const meta = (await $.store.get('session:' + sid)) ?? {}
+    out.push({ id: sid, repo: meta.repo ?? null, startedAt: meta.startedAt ?? null, use: sumModelUse(tables) })
+  }
+  return out.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))
+}
+
 async function pruneStore($, now) {
   try {
     for (const k of await $.store.keys()) {
       if (k.startsWith('day:') && now - Date.parse(k.slice(4)) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
+      if (k.startsWith('models:') && now - Date.parse(k.slice(7)) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
+      if (k.startsWith('session:')) {
+        const v = await $.store.get(k)
+        if (!v || now - (v.startedAt ?? 0) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
+      }
       if (k.startsWith('last:')) {
         const v = await $.store.get(k)
         if (!v || now - (v.ts ?? 0) > 7 * 86400_000) await $.store.delete(k)
@@ -489,7 +547,44 @@ function sidebarLines($, now, W) {
     if (costToday != null) L.push([seg(fmtUsd(costToday), C.green, { bold: true }), seg(' today 📆', C.gray)])
     if (startedAt && now - startedAt > 5 * 60_000) L.push([seg('🔥 ' + fmtUsd(costUsd / ((now - startedAt) / 3600_000)) + '/h', C.orange, { bold: true })])
   }
+
+  const mine = Object.entries(modelsSession)
+  if (mine.length) {
+    L.push(blank(), head('🤖 Models · session', C.text))
+    for (const [m, r] of mine) L.push(...modelUseLines(m, r))
+  }
+  const today = Object.entries(modelsToday)
+  if (today.length) {
+    L.push(blank(), head('📆 Models · today', C.text))
+    for (const [m, r] of today) L.push(modelUseRow(m, r))
+  }
   return L
+}
+
+// One model's use on two rows: who and how long, then the tokens.
+const modelUseLines = (m, r) => [
+  [seg(prettyModel(m) ?? m, C.purple, { bold: true }), seg(' · ' + fmtDur(r.ms), C.gray), seg(' · ' + r.steps + (r.steps === 1 ? ' call' : ' calls'), C.light, { pri: 1 })],
+  [seg('  ' + fmtTokens(r.in) + ' in', C.gray), seg(' · ' + fmtTokens(r.out) + ' out', C.gray), seg(' · ' + fmtTokens(r.cached) + ' cached', C.light, { pri: 1 })],
+]
+
+const fmtDay = (ts) => {
+  const d = new Date(ts)
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0') + ' ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0')
+}
+
+// The day's totals on one row each.
+const modelUseRow = (m, r) => [
+  seg(prettyModel(m) ?? m, C.purple, { bold: true }),
+  seg(' · ' + fmtTokens(r.out) + ' out', C.gray),
+  seg(' · ' + fmtDur(r.ms), C.gray, { pri: 1 }),
+  seg(' · ' + fmtTokens(r.in) + ' in', C.light, { pri: 2 }),
+]
+
+// /statusband models: a plain-text table.
+const modelUseText = (title, t, indent = '  ') => {
+  const rows = Object.entries(t)
+  if (!rows.length) return title + ': nothing yet.'
+  return [title + ':', ...rows.map(([m, r]) => indent + (prettyModel(m) ?? m) + ': ' + fmtTokens(r.in) + ' in · ' + fmtTokens(r.out) + ' out · ' + fmtTokens(r.cached) + ' cached · ' + fmtDur(r.ms) + ' · ' + r.steps + (r.steps === 1 ? ' call' : ' calls'))].join('\n')
 }
 
 // The Scripts tab.
@@ -636,7 +731,7 @@ export function register(on) {
       $.ui.invalidate('ui.render')
     })
     try {
-      await $.command.register({ name: 'statusband', description: 'Status sidebar: open or close it, run or copy a script from .scripts/, or clean out other sessions\' scripts', argumentHint: '[open|close|run|copy|clean] [script]', immediate: true })
+      await $.command.register({ name: 'statusband', description: 'Status sidebar: open or close it, run or copy a script from .scripts/, clean out other sessions\' scripts, or list tokens and time by model', argumentHint: '[open|close|run|copy|clean|models] [script]', immediate: true })
       await $.command.register({ name: 'statusband-debug', description: 'statusband: dump the raw data it reads', immediate: true })
     } catch {}
     return next(e)
@@ -647,6 +742,9 @@ export function register(on) {
       agents.clear()
       lastTurn = null
       turnStart = null
+      modelsSession = {}
+      modelsDay = null // a new session id gets its own share of the day
+      sessionNamed = false
     }
     return next(e)
   })
@@ -664,13 +762,17 @@ export function register(on) {
   })
 
   on('turn.step', async function* ($, e, next) {
+    const t0 = Date.now()
     if (!e.agentId) {
       lastStepKeys = Object.keys(e)
       if (e.model) model = e.model
       if (e.effort) effort = String(e.effort)
-      return yield* next(e)
     }
     const result = yield* next(e)
+    try {
+      await recordModelUse($, e.model ?? (e.agentId ? null : model), result?.usage, Date.now() - t0)
+    } catch {} // an observer: the step's result stands
+    if (!e.agentId) return result
     const a = agents.get(e.agentId)
     if (a && result?.usage) {
       const u = result.usage
@@ -819,6 +921,23 @@ export function register(on) {
       const left = scriptsOthers.length
       return { text: (n ? 'Removed ' + n + ' script' + (n === 1 ? '' : 's') + ' of other sessions from ' + SCRIPTS_DIR + '/.' : 'No scripts of other sessions to remove.') + (left ? ' Kept ' + left + ' changed in the last 15 minutes.' : '') }
     }
+    if (verb === 'models') {
+      const now = Date.now()
+      const sessions = await sessionsOver($, MODEL_DAYS, now)
+      const shown = sessions.slice(0, SESSIONS_SHOWN)
+      const bySession = shown.map((x) =>
+        modelUseText('  ' + (x.id === sessionId ? '▶ ' : '') + (x.repo ?? '?') + ' · ' + (x.startedAt ? fmtDay(x.startedAt) : '?') + ' · ' + x.id.slice(0, 8), x.use, '    '),
+      )
+      if (sessions.length > shown.length) bySession.push('  +' + (sessions.length - shown.length) + ' older')
+      return {
+        text: [
+          modelUseText('This session', modelsSession),
+          modelUseText('Today', await modelsOver($, 1, now)),
+          modelUseText('Last ' + MODEL_DAYS + ' days', await modelsOver($, MODEL_DAYS, now)),
+          'By session, last ' + MODEL_DAYS + ' days:\n' + (bySession.join('\n') || '  nothing yet.'),
+        ].join('\n\n'),
+      }
+    }
     if (verb === 'run' || verb === 'copy') {
       await refreshScripts($)
       // An older session's script is reachable by its name, not as the newest.
@@ -870,7 +989,7 @@ export function register(on) {
     dump.turnStepKeys = lastStepKeys
     dump.paneOpen = paneOpen
     dump.panePlacement = panePlacement
-    dump.derived = { scripts, profile, git, ctx, costUsd, costToday, limits, quotas, model, effort, isRunning, lastTurn, agents: [...agents.values()] }
+    dump.derived = { scripts, profile, git, ctx, costUsd, costToday, modelsSession, modelsToday, limits, quotas, model, effort, isRunning, lastTurn, agents: [...agents.values()] }
     const json = JSON.stringify(dump, null, 2)
     let saved = ''
     try {

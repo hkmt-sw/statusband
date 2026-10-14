@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 // @ts-ignore: plain JS module without types
-import { num, fmtTokens, fmtDur, fmtUsd, dayKey, toMs, bar, shorten, prettyModel, cells, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts } from '../hooks/lib.js'
+import { num, fmtTokens, fmtDur, fmtUsd, dayKey, toMs, bar, shorten, prettyModel, cells, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts, addModelUse, sumModelUse } from '../hooks/lib.js'
 
 const MIN = 60_000
 const HOUR = 60 * MIN
@@ -175,4 +175,16 @@ test('staleScripts: only what Claude wrote; grace by hand, age limit at start-up
   const others = [{ name: 'fresh', mtimeMs: 990, written: true }, { name: 'day', mtimeMs: 500, written: true }, { name: 'old', mtimeMs: 0, written: true }, { name: 'seen', mtimeMs: 0, written: false }]
   expect(staleScripts(others, 1000, 100)).toEqual(['day', 'old'])
   expect(staleScripts(others, 1000, 100, 600)).toEqual(['old'])
+})
+
+test('addModelUse and sumModelUse count by model, busiest first', async () => {
+  const u = { input_tokens: 100, cache_creation_input_tokens: 50, cache_read_input_tokens: 1000, output_tokens: 20 }
+  let a = addModelUse({}, 'claude-opus-5-5', u, 3000)
+  a = addModelUse(a, 'claude-opus-5-5', { output_tokens: 5 }, -1)
+  expect(a['claude-opus-5-5']).toEqual({ in: 150, cached: 1000, out: 25, ms: 3000, steps: 2 })
+  const b = addModelUse({}, 'claude-haiku-5-5', { output_tokens: 90 }, 500)
+  const t = sumModelUse([a, b, a])
+  expect(Object.keys(t)).toEqual(['claude-haiku-5-5', 'claude-opus-5-5'])
+  expect(t['claude-opus-5-5'].out).toBe(50)
+  expect(t['claude-opus-5-5'].steps).toBe(4)
 })

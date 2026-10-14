@@ -314,3 +314,27 @@ test('a .scripts that is a link is left alone', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: /No scripts from this session yet/ })).toBeDefined()
   await ui.unmount()
 })
+
+test('tokens and time add up by model, for the session and the day', async ($, on) => {
+  await setup($, on, undefined, agentBottoms())
+  await twoAgents($)
+  for await (const _ of $.turn.step({ turnId: 'm1', index: 0, model: 'claude-sonnet-5-5', messageCount: 1 } as any)) void _
+  for await (const _ of $.turn.step({ turnId: 'm1', index: 1, model: 'claude-sonnet-5-5', messageCount: 2 } as any)) void _
+  const pane = await $.ui.mount({
+    plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband',
+    props: { title: 'Status', isFocused: false, bodyColumns: 44, placement: 'dock' },
+  } as any)
+  expect(await pane.find({ type: 'Text', text: /Models · session/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /Models · today/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /Sonnet 5\.5/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /2 calls/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /78K out/ })).toBeDefined()
+  await pane.unmount()
+  const r: any = await $.command.run({ command: 'statusband', args: 'models' } as any)
+  expect(r.text).toContain('This session:')
+  expect(r.text).toContain('Opus 5.5: 1K in · 39K out · 127K cached')
+  expect(r.text).toContain('Sonnet 5.5: 2K in · 78K out · 254K cached')
+  expect(r.text).toContain('Last 7 days:')
+  expect(r.text).toMatch(/▶ demo · \d{4}-\d\d-\d\d \d\d:\d\d · s1:/)
+  expect(r.text).toContain('    Sonnet 5.5: 2K in')
+})
