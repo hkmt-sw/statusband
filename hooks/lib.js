@@ -258,3 +258,36 @@ const csvCell = (v) => {
   return /[",\n]/.test(safe) ? '"' + safe.replace(/"/g, '""') + '"' : safe
 }
 export const toCsv = (rows) => rows.map((r) => r.map(csvCell).join(',')).join('\n') + '\n'
+
+// What a shell command reaches beyond the machine or the repo, as tags: net (talks to another host),
+// push (git push), force (a forced push), sudo, delete (a recursive rm), pipe-sh (a download run as a
+// script). Matched where a command starts, past `sudo`, `env` and the like, so `echo curl` alone is no
+// hit. Heuristic, not a parser.
+const AT = '(?:^|[;&|(`\\n]|\\$\\()\\s*(?:\\w+=\\S*\\s+)*(?:(?:sudo|env|time|nohup|exec|command|xargs)\\s+(?:-\\S+\\s+)*)*'
+const TAGS = [
+  ['net', new RegExp(AT + '(?:curl|wget|ssh|scp|sftp|rsync|nc|ncat|telnet|ftp|http|https|xh|aws|gcloud|az|gh|kubectl|helm)\\b')],
+  ['net', new RegExp(AT + '(?:git\\s+(?:\\S+\\s+)*?(?:push|pull|fetch|clone|ls-remote)|npm\\s+publish|docker\\s+(?:push|pull|login))\\b')],
+  ['push', new RegExp(AT + 'git\\s+(?:\\S+\\s+)*?push\\b')],
+  ['force', /\bgit\s+(?:\S+\s+)*?push\b[^;&|\n]*\s(?:--force(?:-with-lease)?|-f)\b/],
+  ['sudo', new RegExp(AT + 'sudo\\b')],
+  ['delete', new RegExp(AT + 'rm\\s+(?:-\\w*[rR]\\w*|--recursive)\\b')],
+  ['pipe-sh', /\b(?:curl|wget)\b[^;&\n]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b/],
+]
+export const commandTags = (cmd) => {
+  const s = String(cmd ?? '')
+  return [...new Set(TAGS.filter(([, re]) => re.test(s)).map(([t]) => t))]
+}
+
+// Where a written file lies: in the repo (or the working directory), in a temp folder, or outside both.
+export const pathScope = (path, root, tmps = []) => {
+  const p = String(path ?? '')
+  const under = (dir) => !!dir && (p === dir || p.startsWith(dir.replace(/\/+$/, '') + '/'))
+  if (!p.startsWith('/') || under(root)) return 'repo'
+  return tmps.some(under) ? 'tmp' : 'outside'
+}
+
+// The first words of a prompt on one line, for a report.
+export const promptHead = (text, n = 60) => shorten(String(text ?? '').replace(/\s+/g, ' ').trim(), n)
+
+// Keeps the costliest n turns.
+export const topTurns = (list, turn, n = 10) => [...list, turn].sort((a, b) => b.cost - a.cost).slice(0, n)

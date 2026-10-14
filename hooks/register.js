@@ -9,7 +9,7 @@
 // Layout ideas (docked/inline modes, agent rows, last-turn receipt) were inspired by
 // scasella/claude-flightdeck (MIT); no code was copied.
 
-import { num, fmtTokens, fmtDur, fmtUsd, fmtClock, dayKey, toMs, bar, shorten, prettyModel, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts, ownerOf, addModelUse, sumModelUse, sparkline, turnsLeft, cacheHit, addToolUse, toCsv } from './lib.js'
+import { num, fmtTokens, fmtDur, fmtUsd, fmtClock, dayKey, toMs, bar, shorten, prettyModel, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts, ownerOf, addModelUse, sumModelUse, sparkline, turnsLeft, cacheHit, addToolUse, toCsv, commandTags, pathScope, promptHead, topTurns } from './lib.js'
 
 // ---------------------------------------------------------------- settings ---
 
@@ -38,6 +38,11 @@ const REPORT_DAYS = 30 // /statusband report's default span
 const CACHE_WARN = 80 // cache share of the input below this is amber, below CACHE_CRIT red
 const CACHE_CRIT = 50
 const SHOWN_ROWS = 5 // repos on the Costs tab, tools on the Activity tab
+const BUDGET_WARN = 80 // share of a budget spent that turns amber; at 100 red, with a notification
+const AUDIT_KEPT = 500 // audit events kept per session and day
+const AUDIT_SHOWN = 2 // flagged events the Activity tab lists
+const TOP_TURNS = 10 // costliest turns kept per session and day, for the report
+const RISKY = ['push', 'force', 'sudo', 'delete', 'pipe-sh']
 const AGENTS_KEPT = 20 // finished ones the Activity tab keeps, newest first
 const SCRIPTS_DIR = '.scripts' // in the working directory; ignores itself in git
 const SCRIPTS_SHOWN = 5
@@ -115,6 +120,12 @@ let repoUse = [] // last MODEL_DAYS by repo: [{ repo, cost, ms, out }]
 let toolUse = {} // this session: { [tool]: { n, err, ms } }
 let turnToolMs = 0 // tool time in the running main turn
 let ctxHist = [] // context tokens after each main turn, since the last drop
+let budget = { day: null, month: null } // USD limits, from the store
+let monthPrev = 0 // this month's cost before today
+let audit = [] // this session's audit events, newest first: [{ at, kind, target, tags, agent }]
+let workRoot = null // the repo's top folder, or the working directory outside git
+let tmpDirs = ['/tmp', '/private/tmp', '/var/folders']
+let turnText = '' // the running main turn's prompt, its first words
 
 // ----------------------------------------------------------------- helpers ---
 
@@ -128,9 +139,11 @@ async function refreshGit($) {
     const st = await $.process.run(['git', ...GIT_SAFE, '--no-optional-locks', '-C', cwd, 'status', '--porcelain=v2', '--branch'])
     if (st.exitCode !== 0) {
       git = { repo: cwd.split('/').filter(Boolean).pop() ?? cwd, branch: null }
+      workRoot = cwd
       return
     }
     const top = await $.process.run(['git', ...GIT_SAFE, '-C', cwd, 'rev-parse', '--show-toplevel'])
+    workRoot = top.stdout.trim() || cwd
     const g = { repo: top.stdout.trim().split('/').pop(), branch: null, dirty: 0, ahead: 0, behind: 0 }
     for (const line of st.stdout.split('\n')) {
       if (line.startsWith('# branch.head ')) g.branch = line.slice(14).trim()
@@ -329,6 +342,9 @@ async function refreshLedger($) {
   const trend = []
   for (let i = TREND_DAYS - 1; i >= 0; i--) trend.push(Number((await $.store.get('day:' + dayKey(now - i * 86400_000))) ?? 0))
   costTrend = trend
+  let month = 0
+  for (let i = 1; i < new Date(now).getDate(); i++) month += Number((await $.store.get('day:' + dayKey(now - i * 86400_000))) ?? 0)
+  monthPrev = month
   const by = {}
   for (const x of await sessionsOver($, MODEL_DAYS, now)) {
     const r = (by[x.repo ?? '?'] ??= { repo: x.repo ?? '?', cost: 0, ms: 0, out: 0 })
@@ -341,7 +357,144 @@ async function refreshLedger($) {
   repoUse = Object.values(by).sort((a, b) => b.cost - a.cost || b.ms - a.ms)
 }
 
-// /statusband report: one CSV row per day and session.
+// ----------------------------------------------------------------- budget ---
+
+async function loadBudget($) {
+  budget = { day: null, month: null, ...((await $.store.get('budget')) ?? {}) }
+}
+
+// The budgets set, with what is spent against each.
+function budgetRows(now) {
+  const out = []
+  if (budget.day) out.push({ span: 'day', label: 'today', period: dayKey(now), spent: costToday ?? 0, limit: budget.day })
+  if (budget.month) out.push({ span: 'month', label: 'month', period: dayKey(now).slice(0, 7), spent: monthPrev + (costToday ?? 0), limit: budget.month })
+  return out.map((b) => ({ ...b, pct: (b.spent / b.limit) * 100 }))
+}
+
+const budgetText = (now) => {
+  const rows = budgetRows(now)
+  if (!rows.length) return 'No budget set. /statusband budget day 20 or /statusband budget month 300 sets one.'
+  return 'Budget:\n' + rows.map((b) => '  ' + b.label + ': ' + fmtUsd(b.spent) + ' of ' + fmtUsd(b.limit) + ' (' + Math.round(b.pct) + '%)').join('\n')
+}
+
+const budgetSegs = (b, w) => {
+  const col = level(b.pct, BUDGET_WARN, 100)
+  const [f, e] = bar(Math.min(100, b.pct), w)
+  return [seg('🎯 ' + b.label.padEnd(6), C.gray), seg(f, col), seg(e, C.light), seg('  ' + Math.round(b.pct) + '%', col, { bold: true }), seg('  ' + fmtUsd(b.spent) + '/' + fmtUsd(b.limit), C.gray, { pri: 1 })]
+}
+
+// ------------------------------------------------------------------ audit ---
+
+// What a tool call leaves in the audit trail: files written, shell commands that reach another
+// host or do harm, fetched URLs, and calls a hook or the person denied. Null for the rest.
+function auditEvent(e, done) {
+  const base = { at: Date.now(), tool: String(e.tool), agent: e.agentId ?? null }
+  const oneLine = (v) => shorten(String(v ?? '').replace(/\s+/g, ' ').trim(), 200)
+  if (done?.deny !== undefined) return { ...base, kind: 'denied', target: oneLine(e.command ?? e.file_path ?? e.url ?? e.notebook_path ?? ''), tags: [] }
+  if (done?.isError) return null
+  if (SCRIPT_WRITERS.includes(e.tool)) {
+    const path = e.file_path ?? e.notebook_path
+    if (!path) return null
+    const scope = pathScope(path, workRoot, tmpDirs)
+    return { ...base, kind: 'write', target: String(path), tags: scope === 'repo' ? [] : [scope] }
+  }
+  if (e.tool === 'Bash') {
+    const tags = commandTags(e.command)
+    return tags.length ? { ...base, kind: 'cmd', target: oneLine(e.command), tags } : null
+  }
+  if (e.tool === 'WebFetch' && e.url) return { ...base, kind: 'fetch', target: String(e.url), tags: ['net'] }
+  return null
+}
+
+async function recordAudit($, ev) {
+  audit = [ev, ...audit].slice(0, AUDIT_KEPT)
+  if (!sessionId) return
+  const key = 'audit:' + dayKey(ev.at)
+  const all = (await $.store.get(key)) ?? {}
+  await $.store.set(key, { ...all, [sessionId]: [...(all[sessionId] ?? []), ev].slice(-AUDIT_KEPT) })
+  await nameSession($, sessionId)
+}
+
+const flagged = (a) => a.kind === 'denied' || a.kind === 'fetch' || a.tags.length > 0
+
+// /statusband audit: one CSV row per event.
+async function writeAudit($, days) {
+  const now = Date.now()
+  const rows = []
+  const metas = {}
+  for (let i = days - 1; i >= 0; i--) {
+    const all = (await $.store.get('audit:' + dayKey(now - i * 86400_000))) ?? {}
+    for (const [sid, evs] of Object.entries(all)) {
+      metas[sid] ??= (await $.store.get('session:' + sid)) ?? {}
+      for (const ev of evs) rows.push({ ...ev, sid, repo: metas[sid].repo ?? '' })
+    }
+  }
+  rows.sort((a, b) => a.at - b.at)
+  const csv = toCsv([['time', 'repo', 'session', 'agent', 'kind', 'tool', 'tags', 'target'], ...rows.map((r) => [fmtDay(r.at), r.repo, r.sid, r.agent ?? '', r.kind, r.tool ?? '', r.tags.join(' '), r.target])])
+  const path = (await tmpPath($)) + '/statusband-audit-' + dayKey(now) + '.csv'
+  await $.fs.write(path, csv)
+  const count = (f) => rows.filter(f).length
+  const parts = [
+    count((r) => r.kind === 'write') + ' writes (' + count((r) => r.tags.includes('outside')) + ' outside the repo)',
+    count((r) => r.tags.includes('net')) + ' network',
+    count((r) => r.tags.some((t) => RISKY.includes(t))) + ' risky commands',
+    count((r) => r.kind === 'denied') + ' denied',
+  ]
+  return { path, rows: rows.length, text: parts.join(' · ') }
+}
+
+async function tmpPath($) {
+  return String((await $.env.get('TMPDIR').catch(() => null)) || '/tmp').replace(/\/+$/, '')
+}
+
+// A finished main turn's cost, kept among the session's costliest of the day.
+async function recordTurn($, t) {
+  if (!sessionId) return
+  const key = 'turns:' + dayKey(t.at)
+  const all = (await $.store.get(key)) ?? {}
+  await $.store.set(key, { ...all, [sessionId]: topTurns(all[sessionId] ?? [], t, TOP_TURNS) })
+}
+
+// The report's Markdown side: each day's totals and the costliest turns.
+async function reportSummary($, days, rows, now) {
+  const md = (v) => String(v ?? '').replace(/\|/g, '\\|')
+  const by = {}
+  for (const r of rows) {
+    const d = (by[r.day] ??= { cost: 0, ms: 0, sessions: 0, repos: {} })
+    const ms = Object.values(r.use).reduce((n, u) => n + u.ms, 0)
+    d.cost += r.cost
+    d.ms += ms
+    d.sessions++
+    d.repos[r.repo ?? '?'] = (d.repos[r.repo ?? '?'] ?? 0) + r.cost
+  }
+  const turns = []
+  const metas = {}
+  for (let i = days - 1; i >= 0; i--) {
+    const all = (await $.store.get('turns:' + dayKey(now - i * 86400_000))) ?? {}
+    for (const [sid, list] of Object.entries(all)) {
+      metas[sid] ??= (await $.store.get('session:' + sid)) ?? {}
+      for (const t of list) turns.push({ ...t, repo: metas[sid].repo ?? '?' })
+    }
+  }
+  turns.sort((a, b) => b.cost - a.cost)
+  const L = ['# statusband report', '', 'Last ' + days + ' days, written ' + fmtDay(now) + '.', '']
+  const bud = budgetRows(now)
+  if (bud.length) L.push('Budget: ' + bud.map((b) => b.label + ' ' + fmtUsd(b.spent) + ' of ' + fmtUsd(b.limit)).join(', ') + '.', '')
+  L.push('## By day', '', '| Day | Cost | Sessions | Model time | Top repo |', '|---|---:|---:|---:|---|')
+  for (const [day, d] of Object.entries(by)) {
+    const top = Object.entries(d.repos).sort((a, b) => b[1] - a[1])[0]
+    L.push('| ' + day + ' | ' + fmtUsd(d.cost) + ' | ' + d.sessions + ' | ' + fmtDur(d.ms) + ' | ' + md(top?.[0]) + ' |')
+  }
+  L.push('', '## Costliest turns', '')
+  if (!turns.length) L.push('None recorded yet.')
+  else {
+    L.push('| When | Repo | Cost | Took | Prompt |', '|---|---|---:|---:|---|')
+    for (const t of turns.slice(0, TOP_TURNS)) L.push('| ' + fmtDay(t.at) + ' | ' + md(t.repo) + ' | ' + fmtUsd(t.cost) + ' | ' + (t.ms != null ? fmtDur(t.ms) : '') + ' | ' + md(t.text || '–') + ' |')
+  }
+  return L.join('\n') + '\n'
+}
+
+// /statusband report: one CSV row per day and session, and a Markdown summary beside it.
 async function writeReport($, days) {
   const now = Date.now()
   const rows = await ledgerDays($, days, now)
@@ -353,8 +506,10 @@ async function writeReport($, days) {
       return [r.day, r.repo ?? '', r.id, r.startedAt ? fmtDay(r.startedAt) : '', r.cost.toFixed(2), (sum('ms') / 60_000).toFixed(1), sum('steps'), sum('in'), sum('cached'), sum('out'), Object.keys(r.use).map((m) => prettyModel(m) ?? m).join('; ')]
     }),
   ])
-  const path = String((await $.env.get('TMPDIR').catch(() => null)) || '/tmp').replace(/\/+$/, '') + '/statusband-report-' + dayKey(now) + '.csv'
+  const path = (await tmpPath($)) + '/statusband-report-' + dayKey(now) + '.csv'
   await $.fs.write(path, csv)
+  const mdPath = path.replace(/\.csv$/, '.md')
+  await $.fs.write(mdPath, await reportSummary($, days, rows, now))
   const by = {}
   for (const r of rows) {
     const x = (by[r.repo ?? '?'] ??= { cost: 0, ms: 0 })
@@ -364,7 +519,7 @@ async function writeReport($, days) {
   const lines = Object.entries(by)
     .sort((a, b) => b[1].cost - a[1].cost)
     .map(([repo, x]) => '  ' + repo + ': ' + fmtUsd(x.cost) + ' · ' + fmtDur(x.ms))
-  return { path, rows: rows.length, text: lines.join('\n') }
+  return { path, mdPath, rows: rows.length, text: lines.join('\n') }
 }
 
 async function pruneStore($, now) {
@@ -373,6 +528,8 @@ async function pruneStore($, now) {
       if (k.startsWith('day:') && now - Date.parse(k.slice(4)) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
       if (k.startsWith('models:') && now - Date.parse(k.slice(7)) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
       if (k.startsWith('costs:') && now - Date.parse(k.slice(6)) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
+      if (k.startsWith('turns:') && now - Date.parse(k.slice(6)) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
+      if (k.startsWith('audit:') && now - Date.parse(k.slice(6)) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
       if (k.startsWith('session:')) {
         const v = await $.store.get(k)
         if (!v || now - (v.startedAt ?? 0) > LEDGER_DAYS * 86400_000) await $.store.delete(k)
@@ -403,6 +560,15 @@ function checkAlerts($) {
     const win = q.label + '@' + (q.resetsAt ?? '') + ':'
     for (const lv of TOAST_LEVELS) if (q.pct >= lv) alertOnce($, win + lv, `${q.icon} ${q.label} limit at ${Math.round(q.pct)}%`)
     if (q.status === 'out') alertOnce($, win + 'out', `🛑 ${q.label} limit runs out in ~${fmtDur(q.eta)}`)
+  }
+  // Budgets: a toast at the warning level, a notification as well once spent, each once per period.
+  for (const b of budgetRows(Date.now())) {
+    const key = 'bud:' + b.span + ':' + b.period + ':'
+    if (b.pct >= BUDGET_WARN) alertOnce($, key + BUDGET_WARN, `🎯 ${Math.round(b.pct)}% of the ${b.span}'s budget spent (${fmtUsd(b.spent)} of ${fmtUsd(b.limit)})`)
+    if (b.pct >= 100 && !alerted.has(key + 100)) {
+      alerted.add(key + 100)
+      void Promise.resolve($.ui.notify(`Budget spent: ${fmtUsd(b.spent)} of ${fmtUsd(b.limit)} this ${b.span}`, { title: 'statusband' })).catch(() => {})
+    }
   }
 }
 
@@ -561,7 +727,8 @@ function compactLines($, now) {
 
   if (costUsd != null) {
     const l = [seg('💰 ', C.green), seg(fmtUsd(costUsd), C.green, { bold: true }), seg(' session', C.gray)]
-    if (costToday != null) l.push(seg(' · ', C.light, { pri: 2 }), seg('📆 ' + fmtUsd(costToday), C.green, { bold: true, pri: 2 }), seg(' today', C.gray, { pri: 2 }))
+    const day = budgetRows(now).find((b) => b.span === 'day')
+    if (costToday != null) l.push(seg(' · ', C.light, { pri: 2 }), seg('📆 ' + fmtUsd(costToday), day ? level(day.pct, BUDGET_WARN, 100) : C.green, { bold: true, pri: 2 }), seg(day ? '/' + fmtUsd(day.limit) : ' today', C.gray, { pri: 2 }))
     if (startedAt && now - startedAt > 5 * 60_000) l.push(sep(), seg('🔥 ' + fmtUsd(costUsd / ((now - startedAt) / 3600_000)) + '/h', C.orange, { bold: true, pri: 1 }))
     L.push(l)
   }
@@ -636,6 +803,7 @@ function sidebarLines($, now, W) {
       ...(costToday != null ? [seg(' · ' + fmtUsd(costToday) + ' today', C.gray, { pri: 1 })] : []),
       seg('  → Costs tab', C.gray, { pri: 2 }),
     ])
+    for (const b of budgetRows(now)) L.push(budgetSegs(b, 10))
   }
   return L
 }
@@ -650,6 +818,7 @@ function costsLines(now, W) {
     L.push(head('💰 Cost'))
     L.push([seg(fmtUsd(costUsd), C.green, { bold: true }), seg(' session', C.gray), ...(costToday != null ? [seg(' · ', C.light), seg(fmtUsd(costToday), C.green, { bold: true }), seg(' today', C.gray)] : [])])
     if (startedAt && now - startedAt > 5 * 60_000) L.push([seg('🔥 ' + fmtUsd(costUsd / ((now - startedAt) / 3600_000)) + '/h', C.orange, { bold: true })])
+    for (const b of budgetRows(now)) L.push(budgetSegs(b, 10))
     // Shown from the first day on; the days with no use count as gaps, not into the average.
     const days = costTrend.filter((v) => v > 0)
     if (days.length) {
@@ -683,7 +852,7 @@ function costsLines(now, W) {
     if (repoUse.length > SHOWN_ROWS) L.push([seg('+' + (repoUse.length - SHOWN_ROWS) + ' more', C.light)])
   }
 
-  L.push(blank(), [seg('/statusband report → CSV', C.light, { pri: 1 })])
+  L.push(blank(), [seg('/statusband report → CSV + summary', C.light, { pri: 1 })])
   return L
 }
 
@@ -738,15 +907,48 @@ function scriptsLines($, W) {
 function activityLines(now, W, rows) {
   const tools = Object.entries(toolUse).sort((a, b) => b[1].ms - a[1].ms).slice(0, SHOWN_ROWS)
   if (!agents.size && !tools.length) return [[seg('No agents or tool calls in this session yet.', C.gray)]]
-  // The tools keep their rows at the bottom; the agents fold into the rest.
-  const toolRows = tools.length ? tools.length + (agents.size ? 2 : 1) : 0
+  const au = auditLines(W)
+  // The tools and the audit keep their rows at the bottom; the agents fold into the rest.
+  const toolRows = (tools.length ? tools.length + (agents.size ? 2 : 1) : 0) + (au.length ? au.length + 1 : 0)
   const L = agents.size ? agentsLines(now, W, rows ? Math.max(4, rows - toolRows) : rows) : []
+  if (au.length) {
+    if (L.length) L.push(blank())
+    L.push(...au)
+  }
   if (tools.length) {
     if (L.length) L.push(blank())
     L.push([seg('🔧 Tools · session', C.text, { bold: true })])
     for (const [t, r] of tools) {
       L.push([seg(shorten(t, 14), C.text), seg(' ' + r.n + '×', C.gray), seg(' · ' + fmtDur(r.ms), C.gray), ...(r.err ? [seg(' · ' + r.err + ' err', C.red, { pri: 1 })] : [])])
     }
+  }
+  return L
+}
+
+// The Activity tab's audit: what the session wrote, reached and was refused, then the latest flagged.
+function auditLines(W) {
+  if (!audit.length) return []
+  const n = (f) => audit.filter(f).length
+  const files = new Set(audit.filter((a) => a.kind === 'write').map((a) => a.target)).size
+  const outside = new Set(audit.filter((a) => a.tags.includes('outside')).map((a) => a.target)).size
+  const net = n((a) => a.tags.includes('net'))
+  const risky = n((a) => a.tags.some((t) => RISKY.includes(t)))
+  const denied = n((a) => a.kind === 'denied')
+  const writes = [seg('✏️ ' + files + (files === 1 ? ' file' : ' files') + ' written', C.text)]
+  if (outside) writes.push(seg(' · ⚠ ' + outside + ' outside the repo', C.amber, { bold: true }))
+  const reach = []
+  const add = (t, color, bold) => reach.push(seg((reach.length ? ' · ' : '') + t, color, { bold }))
+  if (net) add('🌐 ' + net + ' net', C.blue, false)
+  if (risky) add('❗' + risky + ' risky', C.red, true)
+  if (denied) add('⛔ ' + denied + ' denied', C.red, true)
+  const L = [[seg('🛡 Audit · session', C.text, { bold: true })]]
+  if (files) L.push(writes)
+  if (reach.length) L.push(reach)
+  for (const a of audit.filter(flagged).slice(0, AUDIT_SHOWN)) {
+    const red = a.kind === 'denied' || a.tags.some((t) => RISKY.includes(t))
+    const glyph = a.kind === 'denied' ? '⛔' : a.tags.includes('outside') ? '⚠' : red ? '❗' : '🌐'
+    const what = a.kind === 'write' ? a.target.replace(/^.*\/(?=[^/]+\/[^/]+$)/, '…/') : a.target
+    L.push([seg(' ' + glyph + ' ', red ? C.red : a.tags.includes('outside') ? C.amber : C.blue), seg(shorten(what, W - 4), red ? C.red : C.gray)])
   }
   return L
 }
@@ -865,8 +1067,13 @@ export function register(on) {
     await primeModel($)
     await readProfile($)
     await pruneStore($, Date.now())
+    await loadBudget($).catch(() => {})
     try {
       sessionId = await $.session.id()
+    } catch {}
+    try {
+      const t = await $.env.get('TMPDIR')
+      if (t && String(t).startsWith('/')) tmpDirs = [String(t), ...tmpDirs]
     } catch {}
     await cleanScripts($, SCRIPTS_KEEP_MS).catch(() => {})
     $.clock.every(GIT_EVERY_MS, async () => {
@@ -883,7 +1090,7 @@ export function register(on) {
       $.ui.invalidate('ui.render')
     })
     try {
-      await $.command.register({ name: 'statusband', description: 'Status sidebar: open or close it, run or copy a script from .scripts/, clean out other sessions\' scripts, list tokens and time by model, or write a cost report (CSV)', argumentHint: '[open|close|run|copy|clean|models|report] [script|days]', immediate: true })
+      await $.command.register({ name: 'statusband', description: 'Status sidebar: open or close it, run or copy a script from .scripts/, clean out other sessions\' scripts, list tokens and time by model, write a cost report or an audit log (CSV), or set a cost budget', argumentHint: '[open|close|run|copy|clean|models|report|audit|budget] [script|days|day N|month N|off]', immediate: true })
       await $.command.register({ name: 'statusband-debug', description: 'statusband: dump the raw data it reads', immediate: true })
     } catch {}
     return next(e)
@@ -899,6 +1106,7 @@ export function register(on) {
       sessionNamed = false
       toolUse = {}
       ctxHist = []
+      audit = []
     }
     return next(e)
   })
@@ -912,6 +1120,7 @@ export function register(on) {
     } catch {}
     turnStart = { at: Date.now(), cost }
     turnToolMs = 0
+    turnText = promptHead(e.text)
     $.ui.invalidate('ui.render')
     return next(e)
   })
@@ -985,6 +1194,7 @@ export function register(on) {
         agents: [...agents.values()].filter((a) => turnStart && a.spawnedAt >= turnStart.at).length,
         toolMs: turnToolMs,
       }
+      if (lastTurn.costDelta != null) await recordTurn($, { at: turnStart?.at ?? now, cost: lastTurn.costDelta, ms: lastTurn.durationMs, text: turnText }).catch(() => {})
     }
     $.ui.invalidate('ui.render')
     return done
@@ -1001,6 +1211,10 @@ export function register(on) {
       // The first tool call brings up the Activity tab, as the first agent does.
       if (first && Date.now() - paneSeenAt < PANE_STALE_MS) void openAgentsPane($)
     }
+    try {
+      const ev = e.tool ? auditEvent(e, done) : null
+      if (ev) await recordAudit($, ev)
+    } catch {} // an observer: the tool's result stands
     if (SCRIPT_WRITERS.includes(e.tool) && done?.deny === undefined && !done?.isError) {
       try {
         await claimScript($, e.file_path ?? e.notebook_path)
@@ -1104,7 +1318,24 @@ export function register(on) {
     if (verb === 'report') {
       const days = Math.min(LEDGER_DAYS, Math.max(1, parseInt(rest[0], 10) || REPORT_DAYS))
       const r = await writeReport($, days)
-      return { text: (r.rows ? 'Last ' + days + ' days by repo:\n' + r.text + '\n\n' : 'Nothing recorded in the last ' + days + ' days.\n') + 'CSV (one row per day and session): ' + r.path }
+      return { text: (r.rows ? 'Last ' + days + ' days by repo:\n' + r.text + '\n\n' : 'Nothing recorded in the last ' + days + ' days.\n') + 'CSV (one row per day and session): ' + r.path + '\nSummary (by day, costliest turns): ' + r.mdPath }
+    }
+    if (verb === 'audit') {
+      const days = Math.min(LEDGER_DAYS, Math.max(1, parseInt(rest[0], 10) || REPORT_DAYS))
+      const r = await writeAudit($, days)
+      return { text: (r.rows ? 'Last ' + days + ' days: ' + r.text + '\n' : 'Nothing in the audit log for the last ' + days + ' days.\n') + 'CSV (one row per event): ' + r.path }
+    }
+    if (verb === 'budget') {
+      const [span, amount] = rest
+      if (span === 'off') budget = { day: null, month: null }
+      else if (span === 'day' || span === 'month') {
+        const v = amount === 'off' ? null : Number(String(amount ?? '').replace(/^\$/, ''))
+        if (v !== null && !(v > 0)) return { text: 'Usage: /statusband budget day 20 · month 300 · day off · off' }
+        budget = { ...budget, [span]: v }
+      } else if (span) return { text: 'Usage: /statusband budget day 20 · month 300 · day off · off' }
+      if (span) await $.store.set('budget', budget)
+      $.ui.invalidate('ui.render')
+      return { text: budgetText(Date.now()) }
     }
     if (verb === 'models') {
       const now = Date.now()
@@ -1177,12 +1408,12 @@ export function register(on) {
     dump.turnStepKeys = lastStepKeys
     dump.paneOpen = paneOpen
     dump.panePlacement = panePlacement
-    dump.derived = { scripts, profile, git, ctx, costUsd, costToday, costTrend, repoUse, toolUse, ctxHist, modelsSession, modelsToday, limits, quotas, model, effort, isRunning, lastTurn, agents: [...agents.values()] }
+    dump.derived = { scripts, profile, git, ctx, costUsd, costToday, costTrend, repoUse, toolUse, ctxHist, budget, monthPrev, audit: audit.slice(0, 20), workRoot, modelsSession, modelsToday, limits, quotas, model, effort, isRunning, lastTurn, agents: [...agents.values()] }
     const json = JSON.stringify(dump, null, 2)
     let saved = ''
     try {
       // The temp folder, not the working directory, where a commit could pick it up.
-      const path = String((await $.env.get('TMPDIR').catch(() => null)) || '/tmp').replace(/\/+$/, '') + '/statusband-debug.json'
+      const path = (await tmpPath($)) + '/statusband-debug.json'
       await $.fs.write(path, json)
       saved = 'Saved to ' + path + '\n'
     } catch {}

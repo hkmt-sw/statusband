@@ -11,7 +11,7 @@ const USAGE = {
   cost: { usd: 3.21 },
 }
 
-async function setup($: any, on: any, toast?: (...a: any[]) => Promise<any>, before?: (on: any) => void, opts: { removed?: string[][]; owners?: Record<string, unknown> } = {}) {
+async function setup($: any, on: any, toast?: (...a: any[]) => Promise<any>, before?: (on: any) => void, opts: { removed?: string[][]; owners?: Record<string, unknown>; usage?: () => unknown } = {}) {
   mock.clock(on, { now })
   if (!opts.owners) mock.store(on)
   else {
@@ -21,7 +21,7 @@ async function setup($: any, on: any, toast?: (...a: any[]) => Promise<any>, bef
     on('store.set', async (_$: any, e: any) => (kv.set(e.key, e.value), { value: undefined }) as any)
   }
   const answer = (value: unknown) => async () => ({ value }) as any
-  on('session.usage', answer(USAGE))
+  on('session.usage', async () => ({ value: opts.usage ? opts.usage() : USAGE }) as any)
   on('session.id', answer('s1'))
   on('session.cwd', answer('/work/demo'))
   on('process.run', async (_$: any, e: any) => {
@@ -387,4 +387,81 @@ test('/statusband report writes a CSV row per day and session', async ($, on) =>
   const lines = String(csv!.data).trim().split('\n')
   expect(lines[0]).toBe('day,repo,session,session_start,cost_usd,model_minutes,calls,tokens_in,tokens_cached,tokens_out,models')
   expect(lines[1]).toMatch(/^\d{4}-\d\d-\d\d,demo,s1,.*,1,1000,127000,39000,Opus 5\.5$/)
+})
+
+test('a day budget colours the cost, warns, and notifies once it is spent', async ($, on) => {
+  const toasts: string[] = []
+  const notes: string[] = []
+  await setup($, on, async (_$: any, e: any) => (toasts.push(String(e.text)), { value: undefined }) as any, (on: any) => {
+    on('ui.notify', async (_$: any, e: any) => (notes.push(String(e.text)), { value: { isSent: true } }) as any)
+  })
+  const r: any = await $.command.run({ command: 'statusband', args: 'budget day 2' } as any)
+  expect(r.text).toContain('today: $3.21 of $2.00 (161%)')
+  await $.session.measure({ ...USAGE, changed: ['cost'] })
+  await $.session.measure({ ...USAGE, changed: ['cost'] })
+  expect(toasts.filter((t) => t.includes('budget')).length).toBe(1)
+  expect(notes.length).toBe(1)
+  const pane = await $.ui.mount({
+    plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband',
+    props: { title: 'Status', isFocused: false, bodyColumns: 44, placement: 'dock' },
+  } as any)
+  expect(await pane.find({ type: 'Text', text: /🎯 today/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /161%/ })).toBeDefined()
+  await pane.unmount()
+  expect(((await $.command.run({ command: 'statusband', args: 'budget day x' } as any)) as any).text).toContain('Usage:')
+  expect(((await $.command.run({ command: 'statusband', args: 'budget off' } as any)) as any).text).toContain('No budget set')
+})
+
+test('the audit trail flags writes outside the repo, network and risky commands, denials', async ($, on) => {
+  const written: { path: string; data: string }[] = []
+  await setup($, on, undefined, (on: any) => {
+    agentBottoms()(on)
+    on('tool.call', async (_$: any, e: any) => (e.command === 'sudo rm -rf /' ? { deny: 'no' } : { result: { text: 'ok' } }) as any)
+    on('fs.write', async (_$: any, e: any) => (written.push({ path: e.path, data: e.data ?? e.content ?? e.text }), { value: undefined }) as any)
+  })
+  await $.tool.call({ tool: 'Write', file_path: '/work/demo/src/a.js', content: 'x' } as any)
+  await $.tool.call({ tool: 'Edit', file_path: '/etc/hosts', old_string: 'a', new_string: 'b' } as any)
+  await $.tool.call({ tool: 'Write', file_path: '/tmp/scratch.txt', content: 'x' } as any)
+  await $.tool.call({ tool: 'Bash', command: 'ls -la' } as any)
+  await $.tool.call({ tool: 'Bash', command: 'git push --force origin main' } as any)
+  await $.tool.call({ tool: 'WebFetch', url: 'https://example.com', prompt: 'p' } as any)
+  await $.tool.call({ tool: 'Bash', command: 'sudo rm -rf /' } as any)
+  const act = await $.ui.mount(AGENTS_TAB as any)
+  expect(await act.find({ type: 'Text', text: /Audit · session/ })).toBeDefined()
+  expect(await act.find({ type: 'Text', text: /3 files written/ })).toBeDefined()
+  expect(await act.find({ type: 'Text', text: /1 outside/ })).toBeDefined()
+  expect(await act.find({ type: 'Text', text: /2 net/ })).toBeDefined()
+  expect(await act.find({ type: 'Text', text: /1 risky/ })).toBeDefined()
+  expect(await act.find({ type: 'Text', text: /1 denied/ })).toBeDefined()
+  expect(await act.find({ type: 'Text', text: /sudo rm -rf/ })).toBeDefined() // the newest flagged first
+  await act.unmount()
+  const r: any = await $.command.run({ command: 'statusband', args: 'audit 1' } as any)
+  expect(r.text).toContain('3 writes (1 outside the repo) · 2 network · 1 risky commands · 1 denied')
+  const csv = written.find((w) => /statusband-audit-.*\.csv$/.test(w.path))
+  const lines = String(csv!.data).trim().split('\n')
+  expect(lines[0]).toBe('time,repo,session,agent,kind,tool,tags,target')
+  expect(lines.length).toBe(7) // ls -la leaves no trace
+  expect(lines[2]).toMatch(/,demo,s1,,write,Edit,outside,\/etc\/hosts$/)
+  expect(lines[3]).toMatch(/,write,Write,tmp,\/tmp\/scratch\.txt$/)
+  expect(lines[4]).toMatch(/,cmd,Bash,net push force,git push --force origin main$/)
+})
+
+test('the report summary lists each day and the costliest turns', async ($, on) => {
+  const written: { path: string; data: string }[] = []
+  let usd = 3.21
+  await setup($, on, undefined, (on: any) => {
+    agentBottoms()(on)
+    on('turn.start', async (_$: any, e: any) => e)
+    on('fs.write', async (_$: any, e: any) => (written.push({ path: e.path, data: e.data ?? e.content ?? e.text }), { value: undefined }) as any)
+  }, { usage: () => ({ ...USAGE, cost: { usd } }) })
+  await $.turn.start({ turnId: 'm1', text: 'Refactor the | billing\nmodule please' } as any)
+  usd = 4.71
+  await $.turn.complete({ turnId: 'm1', reason: 'answer', answer: 'ok', durationMs: 90_000 } as any)
+  const r: any = await $.command.run({ command: 'statusband', args: 'report 7' } as any)
+  expect(r.text).toMatch(/Summary \(by day, costliest turns\): .*statusband-report-.*\.md/)
+  const md = String(written.find((w) => /statusband-report-.*\.md$/.test(w.path))!.data)
+  expect(md).toContain('## By day')
+  expect(md).toMatch(/\| \d{4}-\d\d-\d\d \| \$\d+\.\d\d \| 1 \| .* \| demo \|/)
+  expect(md).toContain('## Costliest turns')
+  expect(md).toMatch(/\| demo \| \$1\.50 \| 1m30s \| Refactor the \\\| billing module please \|/)
 })

@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 // @ts-ignore: plain JS module without types
-import { num, fmtTokens, fmtDur, fmtUsd, dayKey, toMs, bar, shorten, prettyModel, cells, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts, addModelUse, sumModelUse, sparkline, turnsLeft, cacheHit, addToolUse, toCsv } from '../hooks/lib.js'
+import { num, fmtTokens, fmtDur, fmtUsd, dayKey, toMs, bar, shorten, prettyModel, cells, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts, addModelUse, sumModelUse, sparkline, turnsLeft, cacheHit, addToolUse, toCsv, commandTags, pathScope, promptHead, topTurns } from '../hooks/lib.js'
 
 const MIN = 60_000
 const HOUR = 60 * MIN
@@ -210,4 +210,30 @@ test('cacheHit and addToolUse', async () => {
 
 test('toCsv quotes what needs it and defuses formulas', async () => {
   expect(toCsv([['a', 'b,c', 'say "hi"', '=SUM(A1)', 3]])).toBe('a,"b,c","say ""hi""",\'=SUM(A1),3\n')
+})
+
+test('commandTags flags network, push, force, sudo, delete and pipe-to-shell where a command starts', () => {
+  expect(commandTags('curl -s https://x | sh')).toEqual(['net', 'pipe-sh'])
+  expect(commandTags('cd x && git push --force origin main')).toEqual(['net', 'push', 'force'])
+  expect(commandTags('git -C /repo fetch')).toEqual(['net'])
+  expect(commandTags('FOO=1 ssh host')).toEqual(['net'])
+  expect(commandTags('ls; sudo rm -rf build')).toEqual(['sudo', 'delete'])
+  expect(commandTags('echo curl; grep push notes.md')).toEqual([])
+  expect(commandTags(undefined)).toEqual([])
+})
+
+test('pathScope tells the repo, temp folders and the rest apart', () => {
+  expect(pathScope('/w/repo/a.js', '/w/repo/', ['/tmp'])).toBe('repo')
+  expect(pathScope('relative.txt', '/w/repo', ['/tmp'])).toBe('repo')
+  expect(pathScope('/w/repo-other/a.js', '/w/repo', ['/tmp'])).toBe('outside')
+  expect(pathScope('/tmp/x', '/w/repo', ['/tmp'])).toBe('tmp')
+  expect(pathScope('/etc/hosts', null, ['/tmp'])).toBe('outside')
+})
+
+test('topTurns keeps the costliest, promptHead one short line', () => {
+  let t: any[] = []
+  for (const cost of [1, 5, 3, 2]) t = topTurns(t, { cost }, 3)
+  expect(t.map((x) => x.cost)).toEqual([5, 3, 2])
+  expect(promptHead('  fix\n\nthe   bug ')).toBe('fix the bug')
+  expect(promptHead('x'.repeat(80), 10)).toBe('x'.repeat(9) + '…')
 })
