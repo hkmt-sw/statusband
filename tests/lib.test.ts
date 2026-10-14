@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 // @ts-ignore: plain JS module without types
-import { num, fmtTokens, fmtDur, fmtUsd, dayKey, toMs, bar, shorten, prettyModel, cells, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript } from '../hooks/lib.js'
+import { num, fmtTokens, fmtDur, fmtUsd, dayKey, toMs, bar, shorten, prettyModel, cells, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts } from '../hooks/lib.js'
 
 const MIN = 60_000
 const HOUR = 60 * MIN
@@ -152,4 +152,26 @@ test('pickScript: exact, then prefix, then the newest', async () => {
   expect(pickScript(list, 'fi')?.name).toBe('fix.py')
   expect(pickScript(list, 'nope')).toBe(null)
   expect(pickScript([], undefined)).toBe(null)
+})
+
+test('scriptName: only files directly in the folder', async () => {
+  expect(scriptName('/w/.scripts', '/w/.scripts/a.sh')).toBe('a.sh')
+  expect(scriptName('/w/.scripts', '/w/.scripts/sub/a.sh')).toBe(null)
+  expect(scriptName('/w/.scripts', '/w/.scripts/.gitignore')).toBe(null)
+  expect(scriptName('/w/.scripts', '/w/.scriptsx/a.sh')).toBe(null)
+  expect(scriptName(null, '/w/.scripts/a.sh')).toBe(null)
+})
+
+test('ownScripts: claims, then fresh unclaimed files, belong to the session', async () => {
+  const files = [{ name: 'new.sh', mtimeMs: 200 }, { name: 'theirs.sh', mtimeMs: 300 }, { name: 'mine.sh', mtimeMs: 50 }, { name: 'orphan.sh', mtimeMs: 10 }]
+  const r = ownScripts(files, { 'theirs.sh': 'B', 'mine.sh': 'A' }, 'A', 100)
+  expect(r.mine.map((f) => f.name)).toEqual(['new.sh', 'mine.sh'])
+  expect(r.others.map((f) => f.name)).toEqual(['theirs.sh', 'orphan.sh'])
+  expect(r.claims).toEqual({ 'new.sh': 'A' })
+})
+
+test('staleScripts: grace by hand, age limit at start-up', async () => {
+  const others = [{ name: 'fresh', mtimeMs: 990 }, { name: 'day', mtimeMs: 500 }, { name: 'old', mtimeMs: 0 }]
+  expect(staleScripts(others, 1000, 100)).toEqual(['day', 'old'])
+  expect(staleScripts(others, 1000, 100, 600)).toEqual(['old'])
 })

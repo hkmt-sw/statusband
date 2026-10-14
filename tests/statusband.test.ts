@@ -11,14 +11,24 @@ const USAGE = {
   cost: { usd: 3.21 },
 }
 
-async function setup($: any, on: any, toast?: (...a: any[]) => Promise<any>, before?: (on: any) => void) {
+async function setup($: any, on: any, toast?: (...a: any[]) => Promise<any>, before?: (on: any) => void, opts: { removed?: string[][]; owners?: Record<string, string> } = {}) {
   mock.clock(on, { now })
-  mock.store(on)
+  if (!opts.owners) mock.store(on)
+  else {
+    // A store that already holds another session's claims.
+    const kv = new Map<string, unknown>([['scripts:/work/demo/.scripts', opts.owners]])
+    on('store.get', async (_$: any, e: any) => ({ value: kv.get(e.key) }) as any)
+    on('store.set', async (_$: any, e: any) => (kv.set(e.key, e.value), { value: undefined }) as any)
+  }
   const answer = (value: unknown) => async () => ({ value }) as any
   on('session.usage', answer(USAGE))
   on('session.id', answer('s1'))
   on('session.cwd', answer('/work/demo'))
-  on('process.run', answer({ exitCode: 1, stdout: '', stderr: '' }))
+  on('process.run', async (_$: any, e: any) => {
+    if (e.argv[0] !== 'rm' || !opts.removed) return { value: { exitCode: 1, stdout: '', stderr: '' } } as any
+    opts.removed.push([...e.argv])
+    return { value: { exitCode: 0, stdout: '', stderr: '' } } as any
+  })
   on('ui.toast', toast ?? answer(undefined))
   on('session.model', answer('claude-opus-5-5'))
   on('env.get', answer('work'))
@@ -102,23 +112,40 @@ function scriptFs(log: { fills: string[]; copies: string[]; writes: string[] }) 
   }
 }
 
-test('sidebar lists scripts; run fills the prompt, copy puts the file on the clipboard', async ($, on) => {
+test('the Scripts tab lists scripts; run fills the prompt, copy puts the file on the clipboard', async ($, on) => {
   const log = { fills: [] as string[], copies: [] as string[], writes: [] as string[] }
   await setup($, on, undefined, scriptFs(log))
   expect(log.writes).toContain('/work/demo/.scripts/.gitignore')
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({
-      plugin: 'statusband', surface, component: 'Pane', requestId: 'statusband',
-      props: { title: 'Status', isFocused: false, bodyColumns: 44, placement: 'dock' },
+      plugin: 'statusband', surface, component: 'Pane', requestId: 'statusband-scripts',
+      props: { title: 'Scripts', isFocused: false, bodyColumns: 44, placement: 'dock' },
     } as any)
-    expect(await ui.find({ type: 'Text', text: /Scripts/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /deploy\.sh/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /Deploy the demo to staging/ })).toBeDefined()
     await ui.press({ key: 'run:deploy.sh' })
-    await ui.press({ key: 'copy:old.py' })
+    await ui.press({ key: 'copy:deploy.sh' })
     await ui.unmount()
   }
   expect(log.fills).toEqual(['! bash /work/demo/.scripts/deploy.sh', '! bash /work/demo/.scripts/deploy.sh'])
-  expect(log.copies).toEqual([SCRIPTS['old.py'].text, SCRIPTS['old.py'].text])
+  expect(log.copies).toEqual([SCRIPTS['deploy.sh'].text, SCRIPTS['deploy.sh'].text])
+})
+
+test('the status pane leaves scripts to their tab; /statusband opens both, status last', async ($, on) => {
+  const log = { fills: [] as string[], copies: [] as string[], writes: [] as string[] }
+  const opened: string[] = []
+  await setup($, on, undefined, (on) => {
+    scriptFs(log)(on)
+    on('ui.open', async (_$: any, e: any) => (opened.push(e.id), { value: { isPlaced: true } }) as any)
+  })
+  const ui = await $.ui.mount({
+    plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband',
+    props: { title: 'Status', isFocused: false, bodyColumns: 44, placement: 'dock' },
+  } as any)
+  expect(await ui.find({ type: 'Text', text: /deploy\.sh/ })).toBeUndefined()
+  await ui.unmount()
+  await $.command.run({ command: 'statusband', args: '' } as any)
+  expect(opened).toEqual(['statusband-scripts', 'statusband'])
 })
 
 test('compact view offers the newest script of the session', async ($, on) => {
@@ -151,4 +178,49 @@ test('the system prompt asks for scripts as files', async ($, on) => {
   const mine = r.sections.find((x: any) => x.id === 'statusband:scripts')
   expect(mine?.scope).toBe('session')
   expect(mine?.text).toContain('.scripts/')
+})
+
+test('no compact view under the prompt while the Scripts tab is on show', async ($, on) => {
+  const log = { fills: [] as string[], copies: [] as string[], writes: [] as string[] }
+  await setup($, on, undefined, scriptFs(log))
+  const pane = await $.ui.mount({
+    plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband-scripts',
+    props: { title: 'Scripts', isFocused: false, bodyColumns: 44, placement: 'dock' },
+  } as any)
+  await pane.unmount()
+  const ui = await $.ui.mount({ plugin: 'statusband', surface: 'terminal', ...HINT, viewport: { columns: 140, rows: 40, isFullscreen: true } } as any)
+  expect(await ui.find({ type: 'Text', text: /esc to interrupt/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /ctx/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+const SCRIPTS_TAB = {
+  plugin: 'statusband', surface: 'terminal', component: 'Pane', requestId: 'statusband-scripts',
+  props: { title: 'Scripts', isFocused: false, bodyColumns: 44, placement: 'dock' },
+} as const
+
+test('the Scripts tab shows this session\'s scripts; other sessions\' only as a count to clean', async ($, on) => {
+  const log = { fills: [] as string[], copies: [] as string[], writes: [] as string[] }
+  const removed: string[][] = []
+  await setup($, on, undefined, scriptFs(log), { removed })
+  expect(removed).toEqual([]) // old.py is 3 days old: the start-up cleaner keeps a week
+  const ui = await $.ui.mount(SCRIPTS_TAB as any)
+  expect(await ui.find({ type: 'Text', text: /deploy\.sh/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /old\.py/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /1 from other sessions/ })).toBeDefined()
+  await ui.press({ key: 'clean' })
+  await ui.unmount()
+  expect(removed).toEqual([['rm', '-f', '--', '/work/demo/.scripts/old.py']])
+  // The fixture folder still lists old.py, so a second clean removes it again.
+  const r = await $.command.run({ command: 'statusband', args: 'clean' } as any)
+  expect(JSON.stringify(r)).toContain('Removed 1 script of other sessions')
+})
+
+test('a script another session wrote stays out of this session\'s tab', async ($, on) => {
+  const log = { fills: [] as string[], copies: [] as string[], writes: [] as string[] }
+  await setup($, on, undefined, scriptFs(log), { owners: { 'deploy.sh': 'other-session' } })
+  const ui = await $.ui.mount(SCRIPTS_TAB as any)
+  expect(await ui.find({ type: 'Text', text: /No scripts from this session yet/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /2 from other sessions/ })).toBeDefined()
+  await ui.unmount()
 })

@@ -9,11 +9,12 @@
 // Layout ideas (docked/inline modes, agent rows, last-turn receipt) were inspired by
 // scasella/claude-flightdeck (MIT); no code was copied.
 
-import { num, fmtTokens, fmtDur, fmtUsd, fmtClock, dayKey, toMs, bar, shorten, prettyModel, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript } from './lib.js'
+import { num, fmtTokens, fmtDur, fmtUsd, fmtClock, dayKey, toMs, bar, shorten, prettyModel, limitShape, addSample, quotaFor, fit, scriptDesc, runLine, pickScript, scriptName, ownScripts, staleScripts } from './lib.js'
 
 // ---------------------------------------------------------------- settings ---
 
 const PANE = 'statusband'
+const SCRIPTS_PANE = 'statusband-scripts' // its own tab beside the status pane
 const PANE_COLUMNS = 46
 const PANE_ROWS = 9
 const GIT_EVERY_MS = 15_000
@@ -31,6 +32,9 @@ const LEDGER_DAYS = 35
 const AGENT_KEEP_MS = 10 * 60_000
 const SCRIPTS_DIR = '.scripts' // in the working directory; ignores itself in git
 const SCRIPTS_SHOWN = 5
+const SCRIPTS_KEEP_MS = 7 * 86_400_000 // other sessions' scripts older than this go at session start
+const SCRIPTS_GRACE_MS = 15 * 60_000 // /statusband clean spares other sessions' scripts this fresh
+const SCRIPT_WRITERS = ['Write', 'Edit', 'MultiEdit', 'NotebookEdit']
 
 // Asks the model to hand the person scripts as files the band can run or copy.
 const SCRIPTS_PROMPT = [
@@ -79,8 +83,13 @@ let paneRequested = false
 let paneFailedAt = 0 // when $.ui.open last threw; tried again after PANE_RETRY_MS
 let panePlacement = null
 let lastStepKeys = []
-let scripts = [] // newest first: [{ name, desc, mtimeMs }]
+let scripts = [] // this session's, newest first: [{ name, desc, mtimeMs }]
+let scriptsOthers = [] // other sessions' files in the folder: [{ name, mtimeMs }]
+let sessionId = null
+let sessionSeenAt = Date.now() // fallback start when usage has no startedAt
 let scriptsDir = null // <session cwd>/.scripts, absolute
+let scriptsPaneOpen = false
+let scriptsClosedByUser = false
 
 // ----------------------------------------------------------------- helpers ---
 
@@ -112,25 +121,56 @@ async function refreshGit($) {
   }
 }
 
+const ownersKey = () => 'scripts:' + scriptsDir
+
+async function scriptsFolder($) {
+  scriptsDir = (await $.session.cwd()).replace(/\/+$/, '') + '/' + SCRIPTS_DIR
+  return scriptsDir
+}
+
+// A file Claude wrote into .scripts/ belongs to this session.
+async function claimScript($, path) {
+  if (!sessionId) return
+  const name = scriptName(await scriptsFolder($), path)
+  if (!name) return
+  const owners = (await $.store.get(ownersKey())) ?? {}
+  if (owners[name] !== sessionId) await $.store.set(ownersKey(), { ...owners, [name]: sessionId })
+}
+
 async function refreshScripts($) {
   try {
-    const dir = (await $.session.cwd()).replace(/\/+$/, '') + '/' + SCRIPTS_DIR
-    scriptsDir = dir
+    const dir = await scriptsFolder($)
     if (!(await $.fs.exists(dir))) {
       scripts = []
+      scriptsOthers = []
       return
     }
     if (!(await $.fs.exists(dir + '/.gitignore'))) await $.fs.write(dir + '/.gitignore', '*\n')
     const files = (await $.fs.list(dir))
       .filter((f) => f.kind === 'file' && !f.name.startsWith('.'))
       .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      .slice(0, SCRIPTS_SHOWN)
+    const owners = (await $.store.get(ownersKey())) ?? {}
+    const { mine, others, claims } = ownScripts(files, owners, sessionId, startedAt ?? sessionSeenAt)
+    // Claims of files gone from the folder are dropped.
+    const kept = Object.fromEntries(Object.entries({ ...owners, ...claims }).filter(([n]) => files.some((f) => f.name === n)))
+    if (JSON.stringify(kept) !== JSON.stringify(owners)) await $.store.set(ownersKey(), kept)
+    scriptsOthers = others.map((f) => ({ name: f.name, mtimeMs: f.mtimeMs }))
     scripts = await Promise.all(
-      files.map(async (f) => ({ name: f.name, mtimeMs: f.mtimeMs, desc: scriptDesc(await $.fs.read(dir + '/' + f.name).catch(() => '')) })),
+      mine.slice(0, SCRIPTS_SHOWN).map(async (f) => ({ name: f.name, mtimeMs: f.mtimeMs, desc: scriptDesc(await $.fs.read(dir + '/' + f.name).catch(() => '')) })),
     )
   } catch {
     // unreadable folder: keep the last list
   }
+}
+
+// Deletes other sessions' scripts: by hand all but the freshest, at session start the old ones.
+async function cleanScripts($, maxAgeMs) {
+  await refreshScripts($)
+  const names = staleScripts(scriptsOthers, Date.now(), SCRIPTS_GRACE_MS, maxAgeMs)
+  if (!names.length) return 0
+  const r = await $.process.run(['rm', '-f', '--', ...names.map((n) => scriptsDir + '/' + n)])
+  await refreshScripts($)
+  return r.exitCode === 0 ? names.length : 0
 }
 
 // Run: the `!` line goes into the prompt box, so Enter runs it and its output lands in the transcript.
@@ -414,15 +454,6 @@ function sidebarLines($, now, W) {
     if (st) L.push([st])
   }
 
-  if (scripts.length) {
-    L.push(blank(), head('📜 Scripts', C.blue))
-    for (const sc of scripts) {
-      L.push([seg(shorten(sc.name, W), C.text, { bold: true })])
-      if (sc.desc) L.push([seg('  ' + sc.desc, C.gray)])
-      L.push([seg('  ', C.text), ...scriptButtons($, sc)])
-    }
-  }
-
   if (agents.size) {
     const run = runningAgents()
     L.push(blank(), head('👥 Agents' + (run.length ? ' (' + run.length + ' running)' : ''), C.teal))
@@ -448,6 +479,33 @@ function sidebarLines($, now, W) {
   return L
 }
 
+// The Scripts tab.
+function scriptsLines($, W) {
+  const L = scripts.length ? [] : [[seg('No scripts from this session yet.', C.gray)]]
+  for (const sc of scripts) {
+    if (L.length) L.push(blank())
+    L.push([seg('📜 ' + shorten(sc.name, W - 3), C.blue, { bold: true })])
+    if (sc.desc) L.push([seg('  ' + sc.desc, C.gray)])
+    L.push([seg('  ', C.text), ...scriptButtons($, sc)])
+  }
+  if (scriptsOthers.length) {
+    L.push(blank())
+    L.push([
+      seg(scriptsOthers.length + ' from other sessions  ', C.gray),
+      btn('🧹 clean', 'clean', () => void cleanByHand($).catch(() => {})),
+    ])
+  }
+  return L
+}
+
+async function cleanByHand($) {
+  const n = await cleanScripts($)
+  const left = scriptsOthers.length
+  $.ui.toast('🧹 ' + (n ? 'removed ' + n + ' script' + (n === 1 ? '' : 's') : 'nothing removed') + (left ? ' · ' + left + ' changed in the last 15 min kept' : ''), { timeoutMs: 5000 })
+  $.ui.invalidate('ui.render')
+  return n
+}
+
 function draw($, e, L, cols) {
   const { Box, Text, Button } = $.ui.resolve(e)
   return Box({
@@ -466,7 +524,17 @@ function draw($, e, L, cols) {
   })
 }
 
+// Opened first, so the status pane opened after it is the tab on show.
+async function openScriptsPane($) {
+  if (scriptsPaneOpen || scriptsClosedByUser || !scripts.length) return
+  try {
+    const r = await $.ui.open({ id: SCRIPTS_PANE, title: 'Scripts', columns: PANE_COLUMNS, rows: PANE_ROWS })
+    scriptsPaneOpen = r?.isPlaced !== false
+  } catch {}
+}
+
 async function openPane($) {
+  await openScriptsPane($)
   try {
     paneOpen = await $.ui.open({ id: PANE, title: 'Status', columns: PANE_COLUMNS, rows: PANE_ROWS })
   } catch (err) {
@@ -485,10 +553,14 @@ export function register(on) {
     await primeModel($)
     await readProfile($)
     await pruneStore($, Date.now())
-    await refreshScripts($)
+    try {
+      sessionId = await $.session.id()
+    } catch {}
+    await cleanScripts($, SCRIPTS_KEEP_MS).catch(() => {})
     $.clock.every(GIT_EVERY_MS, async () => {
       await refreshGit($)
       await refreshScripts($)
+      if (Date.now() - paneSeenAt < PANE_STALE_MS) await openScriptsPane($)
       $.ui.invalidate('ui.render')
     })
     $.clock.every(TICK_MS, async () => {
@@ -497,7 +569,7 @@ export function register(on) {
       $.ui.invalidate('ui.render')
     })
     try {
-      await $.command.register({ name: 'statusband', description: 'Status sidebar: open or close it, or run or copy a script from .scripts/', argumentHint: '[open|close|run|copy] [script]', immediate: true })
+      await $.command.register({ name: 'statusband', description: 'Status sidebar: open or close it, run or copy a script from .scripts/, or clean out other sessions\' scripts', argumentHint: '[open|close|run|copy|clean] [script]', immediate: true })
       await $.command.register({ name: 'statusband-debug', description: 'statusband: dump the raw data it reads', immediate: true })
     } catch {}
     return next(e)
@@ -586,6 +658,18 @@ export function register(on) {
     return done
   })
 
+  on('tool.call', async ($, e, next) => {
+    const done = await next(e)
+    if (SCRIPT_WRITERS.includes(e.tool) && done?.deny === undefined && !done?.isError) {
+      try {
+        await claimScript($, e.file_path ?? e.notebook_path)
+        await refreshScripts($)
+        $.ui.invalidate('ui.render')
+      } catch {} // an observer: the tool's result stands
+    }
+    return done
+  })
+
   on('prompt.compose', async ($, e, next) => {
     const r = await next(e)
     if (!r?.sections || e.traits?.includes?.('bare')) return r
@@ -604,6 +688,10 @@ export function register(on) {
       if (e.origin?.kind === 'person') paneClosedByUser = true
       $.ui.invalidate('ui.render')
     }
+    if (e.id === SCRIPTS_PANE) {
+      scriptsPaneOpen = false
+      if (e.origin?.kind === 'person') scriptsClosedByUser = true
+    }
     return next(e)
   }).catch(($, e, next) => next(e)) // an observer: a throw here must not stop the close
 
@@ -616,7 +704,13 @@ export function register(on) {
     return draw($, e, L, W)
   })
 
-  // Under the prompt: the compact view while the pane is not on screen. The pane is opened only
+  on('ui.render', { component: 'Pane', requestId: SCRIPTS_PANE }, async ($, e) => {
+    paneSeenAt = Date.now() // the dock is on screen with Scripts as the tab on show
+    const W = Math.max(24, (e.props?.bodyColumns ?? PANE_COLUMNS) - 1)
+    return draw($, e, scriptsLines($, W), W)
+  })
+
+  // Under the prompt: the compact view while neither dock tab is on screen. The pane is opened only
   // where the surface docks panes (fullscreen terminal, Desktop app); the classic renderer would
   // seat it above the prompt, so there the compact view under the prompt is all there is.
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
@@ -639,10 +733,17 @@ export function register(on) {
 
   on('command.run', { command: 'statusband' }, async ($, e) => {
     const [verb = 'open', ...rest] = (e.args ?? '').trim().split(/\s+/).filter(Boolean)
+    if (verb === 'clean') {
+      const n = await cleanScripts($)
+      const left = scriptsOthers.length
+      return { text: (n ? 'Removed ' + n + ' script' + (n === 1 ? '' : 's') + ' of other sessions from ' + SCRIPTS_DIR + '/.' : 'No scripts of other sessions to remove.') + (left ? ' Kept ' + left + ' changed in the last 15 minutes.' : '') }
+    }
     if (verb === 'run' || verb === 'copy') {
       await refreshScripts($)
-      const sc = pickScript(scripts, rest.join(' '))
-      if (!sc) return { text: scripts.length ? 'No script by that name in ' + SCRIPTS_DIR + '/.' : 'No scripts in ' + SCRIPTS_DIR + '/ yet.' }
+      // An older session's script is reachable by its name, not as the newest.
+      const want = rest.join(' ')
+      const sc = pickScript(scripts, want) ?? (want ? pickScript(scriptsOthers, want) : null)
+      if (!sc) return { text: scripts.length || scriptsOthers.length ? 'No script by that name in ' + SCRIPTS_DIR + '/.' : 'No scripts in ' + SCRIPTS_DIR + '/ yet.' }
       if (verb === 'copy') {
         await copyScript($, sc)
         return { text: 'Copied ' + SCRIPTS_DIR + '/' + sc.name + '.' }
@@ -657,10 +758,14 @@ export function register(on) {
     }
     if (verb === 'close') {
       paneClosedByUser = true
+      scriptsClosedByUser = true
+      await $.ui.close({ id: SCRIPTS_PANE }).catch(() => {})
       await $.ui.close({ id: PANE })
       return { text: 'statusband closed. The compact view stays under the prompt.' }
     }
     paneClosedByUser = false
+    scriptsClosedByUser = false
+    await refreshScripts($)
     const r = await openPane($)
     return { text: r?.isPlaced ? 'statusband opened.' : 'statusband is not shown yet: ' + (r?.reason ?? 'unknown') }
   })

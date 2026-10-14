@@ -154,3 +154,30 @@ export const pickScript = (list, name) => {
   if (!want) return list[0] ?? null
   return list.find((s) => s.name === want) ?? list.find((s) => s.name.startsWith(want)) ?? null
 }
+
+// The script a path names when it sits directly in dir: its file name, else null.
+export const scriptName = (dir, path) => {
+  const p = String(path ?? '')
+  if (!dir || !p.startsWith(dir + '/')) return null
+  const name = p.slice(dir.length + 1)
+  return name && !name.includes('/') && !name.startsWith('.') ? name : null
+}
+
+// Splits the folder's files between this session and the rest. A file no session claims is this
+// session's when it changed after the session started (written by a shell, say), else an orphan.
+export const ownScripts = (files, owners, session, since) => {
+  const mine = []
+  const others = []
+  const claims = {}
+  for (const f of files) {
+    let o = owners[f.name]
+    if (!o && since != null && f.mtimeMs >= since) o = claims[f.name] = session
+    ;(o === session ? mine : others).push(f)
+  }
+  return { mine, others, claims }
+}
+
+// Other sessions' scripts the cleaner may delete: untouched for graceMs (a session running beside
+// this one may still use a newer one), and with maxAgeMs, only those older than that.
+export const staleScripts = (others, now, graceMs, maxAgeMs) =>
+  others.filter((f) => now - f.mtimeMs >= (maxAgeMs ?? graceMs)).map((f) => f.name)
