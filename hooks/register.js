@@ -54,7 +54,7 @@ const SCRIPTS_PROMPT = [
   `The user's status sidebar lists these files with run and copy buttons; \`/statusband run <name>\` and \`/statusband copy <name>\` do the same. Commands you run yourself are not affected.`,
 ].join('\n')
 
-// Claude Code theme keys follow the light/dark theme; teal has no theme key.
+// Claude Code theme keys: they follow the light/dark theme. Teal is the subagents' own cyan.
 const C = {
   green: 'success',
   amber: 'warning',
@@ -63,7 +63,7 @@ const C = {
   purple: 'merged',
   magenta: 'permission',
   orange: 'claude',
-  teal: '#0f766e',
+  teal: 'cyan_FOR_SUBAGENTS_ONLY',
   gray: 'inactive',
   light: 'subtle',
   text: 'text',
@@ -650,9 +650,11 @@ function costsLines(now, W) {
     L.push(head('💰 Cost'))
     L.push([seg(fmtUsd(costUsd), C.green, { bold: true }), seg(' session', C.gray), ...(costToday != null ? [seg(' · ', C.light), seg(fmtUsd(costToday), C.green, { bold: true }), seg(' today', C.gray)] : [])])
     if (startedAt && now - startedAt > 5 * 60_000) L.push([seg('🔥 ' + fmtUsd(costUsd / ((now - startedAt) / 3600_000)) + '/h', C.orange, { bold: true })])
+    // Shown from the first day on; the days with no use count as gaps, not into the average.
     const days = costTrend.filter((v) => v > 0)
-    if (days.length > 1) {
-      L.push([seg(sparkline(costTrend), C.green), seg('  ' + TREND_DAYS + 'd', C.gray), seg(' · avg ' + fmtUsd(days.reduce((a, b) => a + b, 0) / days.length) + '/day', C.gray, { pri: 1 })])
+    if (days.length) {
+      const span = (days.length < TREND_DAYS ? days.length + ' of ' : '') + TREND_DAYS + 'd'
+      L.push([seg(sparkline(costTrend), C.green), seg('  avg ' + fmtUsd(days.reduce((a, b) => a + b, 0) / days.length) + '/day', C.gray), seg(' · ' + span, C.light, { pri: 1 })])
     }
   }
 

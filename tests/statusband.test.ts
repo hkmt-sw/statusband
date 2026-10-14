@@ -354,6 +354,7 @@ test('cost lives on the Costs tab: cache share, tools; the status pane keeps the
   const tab = await $.ui.mount(COSTS_TAB as any)
   expect(await tab.find({ type: 'Text', text: /\$3\.21/ })).toBeDefined()
   expect(await tab.find({ type: 'Text', text: /99%/ })).toBeDefined() // 127K cached of 128K
+  expect(await tab.find({ type: 'Text', text: /1 of 14d/ })).toBeDefined() // the trend shows from the first day
   expect(await tab.find({ type: 'Text', text: /Tools · session/ })).toBeDefined()
   expect(await tab.find({ type: 'Text', text: / 2×/ })).toBeDefined()
   await tab.unmount()
