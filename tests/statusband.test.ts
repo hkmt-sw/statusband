@@ -152,7 +152,7 @@ test('the status pane leaves scripts to their tab; /statusband opens both, statu
   expect(await ui.find({ type: 'Text', text: /deploy\.sh/ })).toBeUndefined()
   await ui.unmount()
   await $.command.run({ command: 'statusband', args: '' } as any)
-  expect(opened).toEqual(['statusband-scripts', 'statusband-costs', 'statusband'])
+  expect(opened).toEqual(['statusband-scripts', 'statusband-agents', 'statusband-costs', 'statusband'])
 })
 
 test('compact view offers the newest script of the session', async ($, on) => {
@@ -290,12 +290,30 @@ test('the Activity tab keeps finished agents in sight when the running ones fill
   await tab.unmount()
 })
 
-test('/statusband opens the Activity tab once there are agents, status last', async ($, on) => {
+test('the tabs open together in a fixed order, status last, and keep it when one comes back', async ($, on) => {
   const opened: string[] = []
-  await setup($, on, undefined, agentBottoms(opened))
-  await twoAgents($)
+  const closed: string[] = []
+  let refuse = 'statusband-agents'
+  await setup($, on, undefined, (on: any) => {
+    agentBottoms()(on)
+    on('ui.open', async (_$: any, e: any) => (opened.push(e.id), { value: { isPlaced: e.id !== refuse } }) as any)
+    on('ui.close', async (_$: any, e: any) => (closed.push(e.id), { value: undefined }) as any)
+  })
   await $.command.run({ command: 'statusband', args: '' } as any)
+  expect(opened).toEqual(['statusband-scripts', 'statusband-agents', 'statusband-costs', 'statusband'])
+  // An agent no longer opens a tab of its own at the end of the row.
+  await twoAgents($)
+  expect(opened.length).toBe(4)
+  // Activity did not take its place: asked again, the tabs after it reopen behind it.
+  refuse = ''
+  opened.length = 0
+  await $.command.run({ command: 'statusband', args: '' } as any)
+  expect(closed).toEqual(['statusband-costs', 'statusband'])
   expect(opened).toEqual(['statusband-agents', 'statusband-costs', 'statusband'])
+  // All in place: a further open only reaches the status pane.
+  opened.length = 0
+  await $.command.run({ command: 'statusband', args: '' } as any)
+  expect(opened).toEqual(['statusband'])
 })
 
 test('files no session claims are the person\'s own: never deleted, no .gitignore written', async ($, on) => {

@@ -1020,35 +1020,32 @@ function draw($, e, L, cols) {
   })
 }
 
-// Opened first, so the status pane opened after it is the tab on show.
-async function openScriptsPane($) {
-  if (scriptsPaneOpen || scriptsClosedByUser || !scripts.length) return
-  try {
-    const r = await $.ui.open({ id: SCRIPTS_PANE, title: 'Scripts', columns: PANE_COLUMNS, rows: PANE_ROWS })
-    scriptsPaneOpen = r?.isPlaced !== false
-  } catch {}
-}
-
-async function openAgentsPane($) {
-  if (agentsPaneOpen || agentsClosedByUser || (!agents.size && !Object.keys(toolUse).length)) return
-  try {
-    const r = await $.ui.open({ id: AGENTS_PANE, title: 'Activity', columns: PANE_COLUMNS, rows: PANE_ROWS })
-    agentsPaneOpen = r?.isPlaced !== false
-  } catch {}
-}
-
-async function openCostsPane($) {
-  if (costsPaneOpen || costsClosedByUser) return
-  try {
-    const r = await $.ui.open({ id: COSTS_PANE, title: 'Costs', columns: PANE_COLUMNS, rows: PANE_ROWS })
-    costsPaneOpen = r?.isPlaced !== false
-  } catch {}
-}
+// The dock lays tabs out in the order they open and shows the one opened last, and no call moves
+// a tab. So the tabs always open together, in this order, the status pane last; when one is missing
+// from the row (closed by hand, then asked for again), those after it close and reopen behind it.
+const TABS = [
+  { id: SCRIPTS_PANE, title: 'Scripts', isOpen: () => scriptsPaneOpen, setOpen: (v) => (scriptsPaneOpen = v), isClosedByUser: () => scriptsClosedByUser },
+  { id: AGENTS_PANE, title: 'Activity', isOpen: () => agentsPaneOpen, setOpen: (v) => (agentsPaneOpen = v), isClosedByUser: () => agentsClosedByUser },
+  { id: COSTS_PANE, title: 'Costs', isOpen: () => costsPaneOpen, setOpen: (v) => (costsPaneOpen = v), isClosedByUser: () => costsClosedByUser },
+]
 
 async function openPane($) {
-  await openScriptsPane($)
-  await openAgentsPane($)
-  await openCostsPane($)
+  const wanted = TABS.filter((t) => !t.isClosedByUser())
+  const gap = wanted.findIndex((t) => !t.isOpen())
+  if (gap >= 0) {
+    for (const t of wanted.slice(gap + 1)) {
+      if (!t.isOpen()) continue
+      await $.ui.close({ id: t.id }).catch(() => {})
+      t.setOpen(false)
+    }
+    if (paneOpen?.isPlaced) await $.ui.close({ id: PANE }).catch(() => {})
+    for (const t of wanted.slice(gap)) {
+      try {
+        const r = await $.ui.open({ id: t.id, title: t.title, columns: PANE_COLUMNS, rows: PANE_ROWS })
+        t.setOpen(r?.isPlaced !== false)
+      } catch {}
+    }
+  }
   try {
     paneOpen = await $.ui.open({ id: PANE, title: 'Status', columns: PANE_COLUMNS, rows: PANE_ROWS })
   } catch (err) {
@@ -1079,7 +1076,6 @@ export function register(on) {
     $.clock.every(GIT_EVERY_MS, async () => {
       await refreshGit($)
       await refreshScripts($)
-      if (Date.now() - paneSeenAt < PANE_STALE_MS) await openScriptsPane($)
       $.ui.invalidate('ui.render')
     })
     await refreshLedger($).catch(() => {})
@@ -1162,8 +1158,6 @@ export function register(on) {
         outTokens: 0,
         steps: 0,
       })
-      // The dock is up: the agent gets its tab now rather than at the next open.
-      if (Date.now() - paneSeenAt < PANE_STALE_MS) void openAgentsPane($)
       $.ui.invalidate('ui.render')
     }
     return started
@@ -1205,11 +1199,8 @@ export function register(on) {
     const done = await next(e)
     if (done?.deny === undefined && e.tool) {
       const ms = Date.now() - t0
-      const first = !Object.keys(toolUse).length
       toolUse = addToolUse(toolUse, String(e.tool), ms, !!done?.isError)
       if (!e.agentId) turnToolMs += ms
-      // The first tool call brings up the Activity tab, as the first agent does.
-      if (first && Date.now() - paneSeenAt < PANE_STALE_MS) void openAgentsPane($)
     }
     try {
       const ev = e.tool ? auditEvent(e, done) : null

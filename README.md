@@ -24,7 +24,7 @@ Scripts: Claude is asked (a system prompt section) to hand you scripts as files 
   <img alt="The compact view under the prompt" src="docs/compact-light.png">
 </picture>
 
-Where it shows: a sidebar docked beside the transcript in a fullscreen terminal (`/tui fullscreen`) and in the Desktop app; a compact multi-line view under the prompt in the classic renderer, or whenever the sidebar isn't on screen. `/statusband close` hides the sidebar, `/statusband` opens it again. Opened by itself the sidebar needs a 144-column terminal (110 once you've opened it by hand).
+Where it shows: a sidebar docked beside the transcript in a fullscreen terminal (`/tui fullscreen`) and in the Desktop app; a compact multi-line view under the prompt in the classic renderer, or whenever the sidebar isn't on screen. `/statusband close` hides the sidebar, `/statusband` opens it again. Its four tabs open together in a fixed order, Scripts · Activity · Costs · Status, with Status on show; a tab closed by hand and asked for again brings the ones after it back behind it, so the order holds. Opened by itself the sidebar needs a 144-column terminal (110 once you've opened it by hand).
 
 ```bash
 claude plugin test .   # engine-backed tests: the trees validate on terminal and desktop
